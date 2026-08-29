@@ -1,8 +1,8 @@
-# 推理框架系统分析流程
+# 推理框架系统分析（个人学习）
 
-这个目录用来整理「推理框架」的系统分析流程：先定分析顺序，再按模块往下填结论、图和源码对照。
+目标：拿到一个新模型，能按固定顺序观察、定位瓶颈、说出优化方向。
 
-当前是占位，内容后续慢慢补。仓库里已有的相关笔记：
+这不是 Agent 调优平台笔记，而是给自己一套能讲清楚的分析框架。仓库里相关材料：
 
 - [推理框架负载均衡路由器](../reasoning-lb-router-design.md)
 - [llm-d：EPP 预测调度 Scorer 与 Coordinator](../llm-d-epp-predicted-scorer-and-coordinator.md)
@@ -10,31 +10,40 @@
 
 ---
 
-## 怎么用
+## 拿到新模型时怎么走
 
-1. 先在本 README 里把分析流程（阶段、输入、产出）写清楚。
-2. 每个阶段单独开文档，放到 `process/`。
-3. 结论、接口、图、源码路径尽量写在对应阶段文档里，避免全堆在这一页。
+```mermaid
+flowchart LR
+  A[定场景] --> B[跑基线]
+  B --> C[分层观察]
+  C --> D[判 Bound]
+  D --> E[选杠杆]
+  E --> F[改一处再测]
+  F --> C
+```
 
----
-
-## 分析流程（待填）
-
-| 阶段 | 文档 | 状态 |
-|------|------|------|
-| 范围与目标 | [process/01-scope.md](process/01-scope.md) | 待填 |
-| 请求路径 | [process/02-request-path.md](process/02-request-path.md) | 待填 |
-| 调度与路由 | [process/03-scheduling.md](process/03-scheduling.md) | 待填 |
-| 执行引擎 | [process/04-engine.md](process/04-engine.md) | 待填 |
-| KV / PD | [process/05-kv-pd.md](process/05-kv-pd.md) | 待填 |
-| 对照结论 | [process/06-comparison.md](process/06-comparison.md) | 待填 |
-
-阶段划分可改，填的时候直接改表。
+1. **定场景**：负载长什么样、SLO 是吞吐还是时延、硬件和并行怎么切。
+2. **跑基线**：Throughput、TTFT、TPOT、显存、NPU 利用率，先有对照数字。
+3. **分层观察**：框架调度 → Runtime / 数据通路 → 算子 Kernel → 硬件利用率。
+4. **判 Bound**：Compute / Memory / Scheduling / Communication / Framework。
+5. **选杠杆**：先参数，再框架路径，再融合和 Kernel；一次只改一类。
+6. **改一处再测**：对比基线，无效就回退，记下「为什么无效」。
 
 ---
 
-## 约定
+## 文档
 
-- 每个阶段文档顶部写：目标、要看的内容、要掌握的知识。
-- 源码路径写本地仓库根（例如 `D:\docs\...`）和上游链接。
-- 图优先用 Mermaid，和图下要点一起放。
+| 部分 | 文档 | 要能说清什么 |
+|------|------|----------------|
+| 为什么系统看 | [process/01-problem.md](process/01-problem.md) | 瓶颈不在一个 Kernel，变量互相咬 |
+| 新模型观察清单 | [process/02-observe.md](process/02-observe.md) | 模型、硬件、负载、并行，先问哪几个问题 |
+| 请求路径 | [process/03-request-path.md](process/03-request-path.md) | 请求从进到出经过哪些阶段、每段看什么指标 |
+| Bound 诊断 | [process/04-diagnose.md](process/04-diagnose.md) | 四层 Profiling 怎么对上五种 Bound |
+| 优化杠杆 | [process/05-levers.md](process/05-levers.md) | 参数、框架、融合、并行各动什么 |
+| 口头讲稿 | [process/06-speak.md](process/06-speak.md) | 五分钟把分析顺序讲完 |
+
+---
+
+## 分析一句话
+
+先用业务负载拿到基线，再按框架 / 调度 / 数据通路 / 算子往下看，用 Bound 类型决定动参数、改执行路径，还是融 Kernel；每次只验证一个假设。
