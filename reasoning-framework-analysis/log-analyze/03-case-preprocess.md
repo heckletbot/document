@@ -16,7 +16,7 @@
 
 ## 基线怎么用
 
-先部署、健康检查、warm up，再跑同一套 conc / 请求数。记下 QPS、输出 tok/s、TTFT（均值和尾部）、E2E。后面只对比这一张表。
+先部署、健康检查、**warm up**，再跑同一套 conc / 请求数。原始输出进 `tune_reports/round_{N}_result.txt`（基线另存 `baseline.txt`）。记下 QPS、输出 tok/s、TTFT（均值和尾部）、E2E。后面只对比这一张表。
 
 ---
 

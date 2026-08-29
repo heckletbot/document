@@ -12,7 +12,7 @@
 
 ## 2 分钟
 
-三类输入：profiling 时间分布、引擎 KV/scheduler 行、benchmark 分位。TTFT 高先拆：排队、下图解码、还是 Prefill 前向。多模态高并发下，线程池过小或串行解析会把 TTFT 打满，NPU 利用率低是结果不是根因。改完同一负载回归；TTFT 降、吞吐抖动几个点，仍可判 Host 路径有收益。
+三类输入：profiling 时间分布、引擎 KV/scheduler 行、benchmark 分位。TTFT 高先拆：排队、下图解码、还是 Prefill 前向。多模态高并发下，线程池过小或串行解析会把 TTFT 打满，NPU 利用率低是结果不是根因。改完同一负载回归；TTFT 降、吞吐抖动几个点，脚本仍可能判有收益（任一指标过 5% 即 OR）。吞吐优先时要自己读 comparison，不要只看退出码。
 
 ---
 
@@ -22,6 +22,8 @@
 2. `preempted` 高时，你先打开 Scheduler 还是 Model Runner？  
 3. 多模态 TTFT 高、但 decode tok/s 正常，Bound 该怎么说？  
 4. 为什么只改 Prefill 补丁时可以不重启 Decode？  
-5. 和融合笔记如何分工：什么时候从本目录转到 `fusion/`？
+5. 和融合笔记如何分工：什么时候从本目录转到 `fusion/`？  
+6. 为什么必须 warm up？冷启动会脏掉哪类指标？  
+7. `has_improvement` 是 AND 还是 OR？TTFT 大降、QPS 微降时退出码是什么、你怎么向别人解释？
 
 说不出来就回 [01](01-metrics-keywords.md) / [02](02-code-map.md)。

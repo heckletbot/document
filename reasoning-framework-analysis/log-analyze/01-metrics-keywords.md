@@ -29,7 +29,7 @@
 
 1. **Profiling 文本**：decode 空闲段、P/D 时间占比。  
 2. **引擎日志**：命中率、preempt 频率、batch 曲线。  
-3. **Benchmark**：吞吐和时延分位；对比两轮时只看同一负载。
+3. **Benchmark**：吞吐和时延分位；对比两轮时只看同一负载。文件命名和「升/降算收益」见 [05-benchmark-compare.md](05-benchmark-compare.md)。
 
 TTFT 高时，多模态请求要先问：时间是耗在 **下图/解码图** 还是 tokenizer 之后的 Prefill。关键字表里没有 `PIL`/`download`/`media` 时，自己补 Host 预处理这一跳。
 
