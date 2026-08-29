@@ -41,6 +41,7 @@ flowchart LR
 | Bound 诊断 | [process/04-diagnose.md](process/04-diagnose.md) | 四层 Profiling 怎么对上五种 Bound |
 | 优化杠杆 | [process/05-levers.md](process/05-levers.md) | 参数、框架、融合、并行各动什么 |
 | 口头讲稿 | [process/06-speak.md](process/06-speak.md) | 五分钟把分析顺序讲完 |
+| 融合算子（杠杆展开） | [fusion/README.md](fusion/README.md) | 何时融、13 种模式、怎么接到 vllm-ascend、怎么用 msprof 验收 |
 
 ---
 

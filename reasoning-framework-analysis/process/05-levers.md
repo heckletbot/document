@@ -42,6 +42,8 @@ PD 分离时还要看 KV 传输是否挡在 Decode 开工之前。对照 Mooncak
 
 融合会改图，可能改变 Runtime 调度，所以融合后要重新看 Idle Gap，不能只看单算子微秒数。
 
+Ascend 上的分层、模式目录、接入路径和验收指标见 [fusion/README.md](../fusion/README.md)。
+
 ---
 
 ## 4. 并行与通信

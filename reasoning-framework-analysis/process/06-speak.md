@@ -39,5 +39,6 @@ Profiler 从上往下：框架有没有组成有效 batch、设备有没有 Idle
 3. 什么现象让你优先改 KV / Prefix Cache，而不是加大 TP？
 4. 为什么融合之后还要再看 Device Idle？
 5. 给你一个 MoE 长上下文、时延 SLO，你第一轮压测和第一轮 Profiler 看哪些图？
+6. 判成 Memory Bound 或 Launch 过碎之后，融合算子怎么讲？见 [fusion/05-speak.md](../fusion/05-speak.md)。
 
 答完再往对应文档里填自己的案例（不要写客户名和未公开指标）。
