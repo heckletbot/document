@@ -63,7 +63,7 @@ XHS 智搜是线上实时服务，纯文本和多模态（图文）同时跑。�
 ```text
 图片处理 ──► Prefill ──► KV 传输 / Decode
    │              │              │
-   │              │              ├ 先 D 后 P 空泡
+   │              │              ├ 先 D 后 P：等上一轮、双份预处理、丢掉 P 首 token、TTFT 走 Decode
    │              │              ├ 逐层 sync 4ms
    │              │              ├ MTP 气泡（待补）
    │              │              └ 调度粒度过粗

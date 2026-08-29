@@ -27,7 +27,7 @@
 | 8 | Prefill 编译 | [08-prefill-inductor.md](08-prefill-inductor.md) | TTFT ↓ 10ms+（不定长并发） |
 | 9 | API Server 分词 | [09-fastokens.md](09-fastokens.md) | TTFT ↓ 20ms |
 | 10 | RS + P 调度 | [10-slo-predictor-scheduling.md](10-slo-predictor-scheduling.md) | P95/P99 TTFT ↓ 16.4%/28.4%（vs 最小请求数） |
-| 11 | P/D KV 调度 | [11-layerwise-cpcd.md](11-layerwise-cpcd.md) | 单并发 TTFT ↓ 70ms+；纯文本再降 20ms+ |
+| 11 | P/D KV 调度 | [11-layerwise-cpcd.md](11-layerwise-cpcd.md) | 单并发 TTFT ↓ 70ms+；纯文本再降 20ms+。社区先 D 后 P vs 先 P 后 D 时序已补 |
 | 12 | P→D KV 数据面 | [12-kv-batch-sync.md](12-kv-batch-sync.md) | TTFT 606→531ms（↓75ms） |
 | 13 | P/D KV 控制面 | [13-zmq-control-plane.md](13-zmq-control-plane.md) | 原文在此截断，实现后半待补 |
 
