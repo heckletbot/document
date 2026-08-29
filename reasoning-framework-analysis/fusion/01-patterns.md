@@ -12,7 +12,7 @@
 |---|------|------|-------------|
 | 1 | Residual + RMSNorm | 两阶段：add+方差，再 rsqrt×weight；写出 new residual | `npu_add_rms_norm_bias`；`AscendRMSNorm.forward_oot` |
 | 2 | SwiGLU | 读拼接 `[gate,up]`，寄存器里 `silu*up` | 多用 `npu_swiglu`；step+mul 有 Triton 变体 |
-| 3 | RMSNorm + Quant | 归一化后在 UB 上直接量化，省全精度中间量 | 图 pass：`npu_add_rms_norm_bias→quant` → `npu_add_rms_norm_quant`；W4A4 / 310P 关掉 |
+| 3 | RMSNorm + Quant | 归一化后在 UB 上直接量化，省全精度中间量 | `AddRMSNormQuantFusionPass`；W4A4 / 310P 关掉 |
 | 4 | 激活 + Quant | 同 #3，激活链一次 pass | 内核或图，看序列是否在一层里 |
 | 7 | RoPE + KV 写 | 旋转后的 K/V 直接进 cache | 少一次 RoPE 输出物化 |
 | 10 | Dequant + SwiGLU + Quant | MoE 专家：int8 权重解量化 → bias → SwiGLU → 再量化 | `dequant_swiglu_quant`（910B/910C）；950 另有 `swiglu_group_quant` |
@@ -28,7 +28,7 @@
 
 | # | 融合 | 要点 | vllm-ascend |
 |---|------|------|-------------|
-| 6 | split QKV + Q/K RMSNorm + RoPE | 按 (token, head) 在片上做完 | `split_qkv_rmsnorm_rope`；常门控 `head_size==128` 且 BF16 |
+| 6 | split QKV + Q/K RMSNorm + RoPE | 按 (token, head) 在片上做完 | `QKNormRopeFusionPass`；`head_size==128` 且 BF16 |
 | 8 | MoE TopK 路由 | softmax→topk→renorm→索引一次做完 | `moe_gating_top_k` |
 | 9 | MoE 专家分发 | permute / grouped GEMM / 激活 / unpermute | `moe_init_routing_custom`（大量 tiling 变体） |
 
@@ -40,7 +40,7 @@
 
 | # | 融合 | 要点 | 门控 |
 |---|------|------|------|
-| 5 | AllReduce + add + RMSNorm | 分块到达就做 norm，与剩余通信重叠 | 图 pass 匹配 Gemm→AllReduce→add_rms；`compile_range.start > 512` 才上（batch 太小重叠没意义） |
+| 5 | AllReduce + add + RMSNorm | 分块到达就做 norm，与剩余通信重叠 | `MatmulAllReduceAddRMSNormPass`；`compile_range.start > 512` |
 | 13 | MC² / 通算 | AllGather+Matmul 按 M 维切分重叠 | `Hccl`+`Matmul` 高层 API，**不能 kernel 直调**；`flash_comm_v1_enabled` 一类开关 |
 
 Serving 里还常见：AllGather 与 unpad、pad 与 AllReduce、matmul 与 reduce 绑在同一 Python 包装里。这是通算/通信包装，不要和 `__mix__` CV 混谈。

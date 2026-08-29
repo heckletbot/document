@@ -43,7 +43,7 @@ flowchart TD
 |------|----------------|
 | [01-patterns.md](01-patterns.md) | 13 种模式对上哪种 Bound、vllm-ascend 里叫什么 |
 | [02-implement.md](02-implement.md) | 编程模型、片上层次、tiling 硬约束 |
-| [03-integrate.md](03-integrate.md) | 路径 A/B/C 和目录清单 |
+| [03-integrate.md](03-integrate.md) | 路径 A/B/C、既有 pass 门控、新增 10 步 |
 | [04-profile-arch.md](04-profile-arch.md) | 用哪些 csv 证明融成功；2201→3510 换了什么通路 |
 | [05-speak.md](05-speak.md) | 五分钟讲「新模型要不要做融合」 |
 
