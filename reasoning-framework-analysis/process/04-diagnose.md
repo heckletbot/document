@@ -2,7 +2,7 @@
 
 基线和路径有了之后，用 Profiler 和日志做根因，不要直接猜「再加大 batch」。
 
-建议顺序：**框架 → 调度 / 通信 → 数据通路 → 算子**。上层能解释的，先不要下到 Kernel。
+建议顺序：**框架 → 调度 / 通信 → 数据通路 → 算子**。上层能解释的，先不要下到 Kernel。引擎日志和 benchmark 的切片方法见 [log-analyze](../log-analyze/README.md)；算子 msprof 仍走 [fusion](../fusion/README.md)。
 
 ---
 

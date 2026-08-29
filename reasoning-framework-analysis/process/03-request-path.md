@@ -21,7 +21,7 @@ flowchart LR
 | 阶段 | 在干什么 | 异常时长往往意味着 |
 |------|----------|--------------------|
 | 收包与解析 | HTTP / OpenAI schema、tokenize | 协议、tokenizer、Host CPU |
-| 多模态预处理（若有） | 图像/视频进视觉编码器 | 视觉算子、Host–Device 拷贝 |
+| 多模态预处理（若有） | 图像/视频进视觉编码器 | 视觉算子、Host–Device 拷贝；**下图/解码排队会直接打高 TTFT**，见 [日志分析](../log-analyze/README.md) |
 | 排队与调度 | 入队、组 batch、选 Worker | 队列堆积、batch 组不满、长短请求互堵 |
 | Prefill | 整段 prompt 一次前向 | 计算或显存带宽；TTFT 主因之一 |
 | 采样与首 token | logits → token | 采样实现、同步等待 |
