@@ -1,6 +1,6 @@
 # MTP 零气泡：vLLM 社区怎么实现
 
-材料对的是社区合并稿 [vllm#32951](https://github.com/vllm-project/vllm/pull/32951)（`fafe76b`，从 [#29957](https://github.com/vllm-project/vllm/pull/29957) 重构）。主文件：
+对的是社区合并稿 [vllm#32951](https://github.com/vllm-project/vllm/pull/32951)（`fafe76b`，从 [#29957](https://github.com/vllm-project/vllm/pull/29957) 重构）。主文件：
 
 - `vllm/v1/worker/gpu_model_runner.py`
 - `vllm/v1/spec_decode/utils.py` 里的 `update_num_computed_tokens_for_batch_change`
