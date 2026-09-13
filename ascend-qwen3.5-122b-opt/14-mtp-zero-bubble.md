@@ -48,7 +48,9 @@ def _get_valid_sampled_token_count(self) -> list[int]:
     return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
 ```
 
-async + spec 时，本拍 CPU 准备（`_update_states` + `_prepare_inputs` + 图 launch）只能和 **上一拍 draft 的 GPU** 重叠。draft 比这段 CPU 短，中间就空一截。XHS 场景 profiling 是 **每 Decode step 5ms+**。
+`synchronize()` 卡住的是 **CPU**，不是 GPU 还在算没算完。sample 算接受个数这件事 GPU 早就做完了；CPU 不把这个数拿回来、不组好下一拍 input，就 **不会 launch 下一串 kernel**。GPU 队列空了，只能空转。这才是气泡。
+
+async + spec 但不走零气泡时，本拍 CPU 准备（`_update_states` + `_prepare_inputs` + 图 launch）只能和 **上一拍 draft 的 GPU** 重叠。draft 比这段 CPU 短，draft 结束后 GPU 又空一截。XHS 场景 profiling 是 **每 Decode step 5ms+**。
 
 ```mermaid
 sequenceDiagram
@@ -97,6 +99,38 @@ sequenceDiagram
     Note over GPU: 计算连续，几乎无空闲
     GPU-->>CPU: forward 发出后再 sync 改 CPU 账
 ```
+
+### 不等的话 GPU 在做什么
+
+不等，不是让 GPU 空着瞎跑，也不是 GPU 还在算「接受了几个」。**接受个数 GPU 在 step N sample 时已经算完了**，就放在 `valid_sampled_token_count_gpu` 上。CPU 再等一次 D2H，只是为了自己改账本，GPU 从这次等里拿不到任何新计算。
+
+CPU 不等之后，它马上按乐观假设把下一拍 kernel 推进 GPU 队列。GPU 接着干的是 **step N+1 自己的活**：
+
+```text
+step N 已经做完:
+  target forward → sample →（可选）draft
+  valid_count 已经在 GPU 上
+
+CPU 不等，立刻 enqueue:
+  ① update_num_computed_tokens_for_batch_change   用 GPU 上的 valid_count 改长度
+  ② positions / seq_lens / slot_mapping            用修正后的 computed 算
+  ③ step N+1 的 target forward                     大头，几十 ms 量级的 MoE/注意力
+
+与此同时（旁路，不挡 ①②③）:
+  copy stream 把 valid_count 非阻塞抄到 CPU
+  CPU 在 ③ 已经 launch 之后才 synchronize，改自己的账本
+```
+
+所以时间线上比的是这件事：
+
+```text
+改前 GPU:  [step N sample/draft] [---- 空等 CPU 5ms+ ----] [step N+1 forward]
+改后 GPU:  [step N sample/draft] [修正 kernel ~0.1ms] [step N+1 forward 立刻接上]
+                                         ↑
+                                    旁路 D2H，CPU 自己慢慢拿
+```
+
+GPU 不等 CPU 的原因：下一拍要的「真实长度」GPU 自己有，kernel 当场改；CPU 要的只是 scheduler / hybrid 账本，可以等 forward 飞起来再拿。
 
 ---
 
