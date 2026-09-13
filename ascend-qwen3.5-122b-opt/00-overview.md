@@ -65,7 +65,7 @@ XHS 智搜是线上实时服务，纯文本和多模态（图文）同时跑。�
    │              │              │
    │              │              ├ 先 D 后 P：等上一轮、双份预处理、丢掉 P 首 token、TTFT 走 Decode
    │              │              ├ 逐层 sync 4ms
-   │              │              ├ MTP 气泡（待补）
+   │              │              ├ MTP 同步气泡 5ms+（0.19 零气泡未完全使能）
    │              │              └ 调度粒度过粗
    │              ├ 混合架构 kernel 吃不满 A3
    │              ├ 动态 shape 静态图无法复用
@@ -91,7 +91,7 @@ API Server:   ②③ 首 token / 分词相关（fastokens 等）
 MM Worker:    ④ 视觉 token 稀疏化     ⑤ 预处理下沉     ⑥ ViT 融合
 Prefill:      ⑦ fastokens（编码）     ⑧ Inductor 入图  细粒度 APC
 P/D 间:       ⑨ MoE AllGather+ReduceScatter
-Decode:       ⑩ MTP 零气泡（待补）    ⑪ ArgMax 前移     ⑫ AscendC
+Decode:       ⑩ MTP 零气泡            ⑪ ArgMax 前移     ⑫ AscendC
 ```
 
-编号按原文全景图。学习时按生命周期读：01→02→03/04/05→07/08/09→11/12/13→06/10。
+编号按原文全景图。本次只总结五项：先 P 后 D、KV batch sync、细粒度 APC、Prefill Inductor、MTP 零气泡，见 [关键优化.md](关键优化.md)。

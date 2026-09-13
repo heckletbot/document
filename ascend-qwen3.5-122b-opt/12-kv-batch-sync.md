@@ -35,4 +35,4 @@ N 由 `VLLM_CLOUD_KV_BATCH_SIZE` 控制。N 越大，sync 次数越少、下发�
 
 - 识别手段是 **Event sync 耗时 + enqueue 间隙占比（84.4%）**，直接指向 host/device 同步，而不是 RDMA 带宽。
 - 实现是 **延迟同步 + 攒层传输**，计算 kernel 不再每层被 sync 卡住。
-- 和 ZMQ 控制面（[13](13-zmq-control-plane.md)）分离：这里是数据面 stream。
+- 和先 P 后 D（[11](11-layerwise-cpcd.md)）正交：那条改调度与首 token 路径，这条改数据面每层 sync 粒度。
