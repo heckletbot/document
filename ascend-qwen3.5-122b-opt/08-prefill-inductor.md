@@ -143,6 +143,23 @@ eager：`rms` launch 一次、`mul` 一次、`add` 一次，中间结果写 HBM�
 
 时间线也要分开：编译（融合 + 生成带 `s0` 的 kernel）在捕获之后做一次；之后每个请求只是 launch，带上这次的长度。不是每个请求 launch 时现场再融合。
 
+## 关掉 Triton、fallback 到 NPU 原算子，这些优化还在吗
+
+还在的是**图级**优化；变薄的是「很多小算子收成一个自研 kernel」那一档。
+
+Inductor 先在 FX / Inductor IR 上做一遍，再决定每个节点 lowering 到哪。不写 Triton、改调 ACLNN/ATB，只换最后一截，前面那遍还在。
+
+| 优化 | fallback 到 NPU 原算子之后 |
+|------|---------------------------|
+| 消除冗余（DCE / CSE / 常量折叠 / 代数简化） | **还在**。编译期从图里删掉死代码、合并重复计算，和是不是 Triton 无关 |
+| Buffer reuse（存活区间、中间 tensor 复用同一块显存） | **还在**，这篇的 `allow_buffer_reuse=True` 就是干这个。管不到算子内部自己申请的 workspace |
+| Host 下发 | **还在一点**：编好的图不再走 Python 逐算子调度，少一层解释器税。**薄很多**：每个还在的库算子仍要单独 launch，没有「10 个逐点合成 1 个 Triton kernel」那种数量级下降 |
+| 逐点融合进寄存器、中间不落 HBM | **基本没了**，除非 NPU 侧正好有对应的融合算子（AscendKernel / 融合 ACLNN）可被 lowering 选中 |
+
+所以：能在 NPU 上把 Inductor 跑起来，不等于还拥有 GPU+Triton 那套融合收益。图还是图，冗余能消、buffer 能复用、动态 `s0` 还能传；host 大头取决于 lowering 之后还剩多少次库算子 launch。
+
+这篇 Prefill 优化不是纯 1:1 fallback。`torch_npu._inductor` 走 AscendKernel，仍可能把一部分节点降到 NPU 融合接口，再加 buffer 复用。原文说的「下发次数下降、融合减 HBM」指的是这一层，不是「每个 aten 都原样调一次 ACLNN」。若真做成纯 fallback，TTFT 那 10ms+ 里融合/下发的部分会小很多，剩下主要是去 Python 和消冗余。
+
 ## 问题怎么识别
 
 Prefill 动态 shape 跨度极大（几十 token 到几十万）。先试了社区 **Piecewise ACLGraph**：
@@ -183,6 +200,7 @@ Prefill 全面改 `torch.compile` + Inductor（`torch_npu._inductor`），端到
 - 固定 shape 是 ACLGraph 回放的约束。Inductor 是 codegen：结构固定、长度当 kernel 参数。FakeTensor + SymInt 种符号，lowering 时不把 1024 写进指令。
 - 用 Inductor 不要求每个算子另做动态版。自己生成的 kernel 自带 `s0`；库算子大多本来就吃运行时 dim。只有内部焊死 shape 或 lowering 失败的，才会特化 / graph break。
 - 融合（一次 launch 多个小算子）和动态 shape（长度当参数）是两件事。中间结果进寄存器，不是「中间不需要 shape」；少下发也不等于能动态（ACLGraph 就是反例）。
+- 关掉 Triton、改调 NPU 原算子：DCE/CSE 和 buffer reuse 还在；逐点融合成一个 kernel 基本没了，host 下发收益变薄。这篇实际走的是 AscendKernel，不是纯 1:1 fallback。
 - 识别有两层：业务上 piecewise **无收益**；工程上 ACLGraph × 二级流水 **不可用**。后者比「慢」更硬。
 - 实现不是「打开 compile 开关」就完，必须处理 **NPU 原地算子的反函数化** 和 **关掉 Triton / 内存重排**。
 - MTP Prefill 要单独去掉 `enforce_eager`，否则主模型入图、draft 仍 eager。
