@@ -4,6 +4,32 @@
 - 收益：不定长并发下 TTFT ↓ 10ms+（短序列更明显）
 - 开启：删 `--enforce-eager`；加 `--additional-config '{"ascend_turbo_graph_config":{"enabled":true}}'`；MTP 去掉 `speculative_config.enforce_eager: true`
 
+## 什么是 Inductor
+
+Inductor 是 PyTorch `torch.compile` 默认的**图编译后端**，不是一种图格式，也不是 ACLGraph 那种「把已经下发的算子录下来回放」。
+
+`torch.compile` 三截：
+
+```text
+Python forward
+    → Dynamo：把 eager 代码收成一张 FX 图（带 shape/类型守卫）
+    → Inductor：在这张图上做融合、调度、内存规划，再 lowering 成可执行 kernel
+    → 运行：走编译产物；命中缓存就不再编
+```
+
+eager 是一算子一 launch。Inductor 把一段 forward 当成一张图优化：相邻逐点算子合成一个 kernel、少几次 HBM 往返、少几次 host 下发。GPU 上它常生成 Triton kernel；这条优化用的是昇腾后端 `torch_npu._inductor`，关掉 Triton，lowering 到 NPU 原生算子（AscendKernel）。
+
+和这篇里先试过的 **ACLGraph** 对比：
+
+| | ACLGraph（类 CUDA Graph） | Inductor |
+|--|---------------------------|----------|
+| 干什么 | 录一段已有算子序列，之后 replay | 真正编译图：融合、codegen、内存规划 |
+| 动态 shape | 基本靠分档（piecewise / bucket） | 符号 shape，同一套产物能吃一档跨度 |
+| 和多 stream | 整段绑在同一 stream 顺序执行 | 不强制单 stream，能和 HCCL overlap 共存 |
+| 「入图」指什么 | 进 replay 图 | 进 `torch.compile` 图 |
+
+所以「Prefill Inductor 入图」= 把 Prefill 的 forward 交给 Dynamo 收图、Inductor 编译，而不是 eager 逐算子下发，也不是 ACLGraph 回放。
+
 ## 问题怎么识别
 
 Prefill 动态 shape 跨度极大（几十 token 到几十万）。先试了社区 **Piecewise ACLGraph**：
@@ -39,6 +65,7 @@ Prefill 全面改 `torch.compile` + Inductor（`torch_npu._inductor`），端到
 
 ## 学习要点
 
+- Inductor 是 `torch.compile` 的编译器后端：收图之后融合/lowering，不是 ACLGraph 那种录制回放。
 - 识别有两层：业务上 piecewise **无收益**；工程上 ACLGraph × 二级流水 **不可用**。后者比「慢」更硬。
 - 实现不是「打开 compile 开关」就完，必须处理 **NPU 原地算子的反函数化** 和 **关掉 Triton / 内存重排**。
 - MTP Prefill 要单独去掉 `enforce_eager`，否则主模型入图、draft 仍 eager。
