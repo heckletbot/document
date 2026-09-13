@@ -65,7 +65,7 @@ XHS 智搜是线上实时服务，纯文本和多模态（图文）同时跑。�
    │              │              │
    │              │              ├ 先 D 后 P：等上一轮、双份预处理、丢掉 P 首 token、TTFT 走 Decode
    │              │              ├ 逐层 sync 4ms
-   │              │              ├ MTP 气泡（待补）
+   │              │              ├ MTP 同步气泡 5ms+（0.19 零气泡未完全使能）
    │              │              └ 调度粒度过粗
    │              ├ 混合架构 kernel 吃不满 A3
    │              ├ 动态 shape 静态图无法复用
@@ -91,7 +91,24 @@ API Server:   ②③ 首 token / 分词相关（fastokens 等）
 MM Worker:    ④ 视觉 token 稀疏化     ⑤ 预处理下沉     ⑥ ViT 融合
 Prefill:      ⑦ fastokens（编码）     ⑧ Inductor 入图  细粒度 APC
 P/D 间:       ⑨ MoE AllGather+ReduceScatter
-Decode:       ⑩ MTP 零气泡（待补）    ⑪ ArgMax 前移     ⑫ AscendC
+Decode:       ⑩ MTP 零气泡            ⑪ ArgMax 前移     ⑫ AscendC
 ```
 
-编号按原文全景图。学习时按生命周期读：01→02→03/04/05→07/08/09→11/12/13→06/10。
+编号按原文全景图。
+
+五项关键优化单独成文，见 [关键优化.md](关键优化.md)。其余特性只记在本总览，不另开文档。
+
+## 其他优化（只在总览）
+
+| 特性 | 一句话 | 原文收益 |
+|------|--------|---------|
+| 图片预处理下沉 Worker | API Server 模块计时后，下载直写 + HF 预处理下到多进程 Worker，避开 GIL 和 shm | TTFT ↓ 80ms+ |
+| 视觉 token 稀疏化 | API 读文件头虚算 `grid_thw`，Worker 按同一 `PHASE3_IMAGE_SCALE` resize | TTFT ↓ 40ms+ |
+| AscendC 算子 | Triton 吃不满 A3，GDN/Conv1D/RMSNorm 等用 AscendC 重写、融合 | 整体 ↓ 120ms+ |
+| ViT 算子融合 | RoPE+Attention、Add+LN、跨层 Add-Norm1 融合 | TTFT ↓ 10ms+ |
+| MoE AllGather+ReduceScatter | TP4EP4、`top_k=8` 时替换 AlltoAll；仅 P 侧 DP=1 | TTFT ↓ 15ms |
+| ArgMax 前移 | MTP draft 先局部 argmax 再 AllGather token_id | 计算量缩 1/TP，通信从 hidden 降到 id |
+| fastokens | 编码换 Rust BPE，解码仍回 HF | TTFT ↓ 20ms |
+| SLO 预测调度 | 预测器 + Slack 组 batch + RS 按完成度衰减负载 | vs 最小请求数：P95/P99 TTFT ↓ 16.4%/28.4% |
+| ZMQ 控制面 | 热路径 log 降级 + socket 池化（原文后半截断） | 未给量化收益 |
+| 绑核 / GIL | 第四阶段稳定性（原文本节未展开） | — |
