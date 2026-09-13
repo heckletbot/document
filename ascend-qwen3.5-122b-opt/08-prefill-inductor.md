@@ -122,6 +122,27 @@ grid = cdiv(s0, BLOCK)     # launch 配置也按本次 s0 算
 
 这篇优化关掉 Triton、走 NPU 原生算子，前提是这些 ACLNN/ATB 接口本身吃运行时 dim。`reshape_and_cache` / RoPE 要改的是原地写语义（反函数化），不是「缺动态版」。
 
+## 融合一次下发，和动态 shape 是两件事
+
+容易把 Inductor 收成一句话：「融合了，中间不必带动态 shape，输入传一次长度，launch 一次就下发多个算子。」前半（融合少 launch）对，后半（所以才能动态）不对。
+
+Inductor 做两件**正交**的事：
+
+| | 融合 / 少下发 | 动态 shape |
+|--|----------------|------------|
+| 何时发生 | **编译期**把 add+mul+rms 收成一个 kernel | **编译期**把长度写成 kernel 参数 `s0` |
+| 运行期（launch） | 一次 launch 跑完原来好几个小算子 | 把本次 `s0=800` 填进去 |
+| 没有它时 | 仍可动态：每个小算子各自带 `s0` launch | 仍可融合：焊死 1024 也能融，只是换长度要重编 |
+
+eager：`rms` launch 一次、`mul` 一次、`add` 一次，中间结果写 HBM。  
+融合后：一个 kernel 里在寄存器里做完，**少的是 launch 次数和 HBM 往返**，不是「中间不再有长度」。循环仍是 `for i in 0..s0`，中间值跟着同一个 `s0` 走，只是不再变成独立的全局 tensor。
+
+没融进去的大算子（matmul、attention）照样各自 launch，它们的输入/输出 tensor 该有动态 shape 还是有，只是 Inductor 做了 buffer 复用。
+
+动态 shape 能用，是因为 **codegen 把长度当参数**；融合只是顺带让一次 launch 多干点活。ACLGraph 也能「一次 replay 很多算子」，但长度焊死——说明少下发 ≠ 能动态。
+
+时间线也要分开：编译（融合 + 生成带 `s0` 的 kernel）在捕获之后做一次；之后每个请求只是 launch，带上这次的长度。不是每个请求 launch 时现场再融合。
+
 ## 问题怎么识别
 
 Prefill 动态 shape 跨度极大（几十 token 到几十万）。先试了社区 **Piecewise ACLGraph**：
@@ -161,6 +182,7 @@ Prefill 全面改 `torch.compile` + Inductor（`torch_npu._inductor`），端到
 - 「动态 shape 捕获」= Dynamo 把会变的维收成符号 `s0`，不是焊死本次长度。编译一次，运行时代入不同 seq。
 - 固定 shape 是 ACLGraph 回放的约束。Inductor 是 codegen：结构固定、长度当 kernel 参数。FakeTensor + SymInt 种符号，lowering 时不把 1024 写进指令。
 - 用 Inductor 不要求每个算子另做动态版。自己生成的 kernel 自带 `s0`；库算子大多本来就吃运行时 dim。只有内部焊死 shape 或 lowering 失败的，才会特化 / graph break。
+- 融合（一次 launch 多个小算子）和动态 shape（长度当参数）是两件事。中间结果进寄存器，不是「中间不需要 shape」；少下发也不等于能动态（ACLGraph 就是反例）。
 - 识别有两层：业务上 piecewise **无收益**；工程上 ACLGraph × 二级流水 **不可用**。后者比「慢」更硬。
 - 实现不是「打开 compile 开关」就完，必须处理 **NPU 原地算子的反函数化** 和 **关掉 Triton / 内存重排**。
 - MTP Prefill 要单独去掉 `enforce_eager`，否则主模型入图、draft 仍 eager。
