@@ -61,6 +61,45 @@ eager 是一算子一 launch。Inductor 把一段 forward 当成一张图优化�
 
 代价：符号维上有些优化更保守（不能按某个固定长度死展开）。`fullgraph=True` 是为了整条 forward 都留在同一张带 s0 的图里，融合才吃得满；中途 graph break 会把后面踢回 eager，动态捕获也救不了那截。
 
+## 符号维是怎么做出来的（为什么不必焊死 shape）
+
+「编译必须固定 shape」对的是 **ACLGraph / CUDA Graph**：回放图把 launch 配置、tensor 地址、grid 都录死，长度一变就不能 replay。Inductor 不是回放器，它是 **codegen**：生成「长度当参数」的 kernel，所以编译期不必知道 800 还是 1024。
+
+实现上分三步，符号是在捕获时种下的，不是 Inductor 事后猜的。
+
+**1. 捕获时用 FakeTensor + SymInt，不拿真实数往前推**
+
+Dynamo 不跑真 NPU。每个中间结果是 FakeTensor：dtype / rank / device 是真的，尺寸可以是符号 `s0`（`torch.SymInt`），派生长度是表达式（`s0 * 2`、`s0 // 32`）。第一次请求的 1024 只当 **hint**（给 Inductor 看个例子、估个 grid），不写进守卫。
+
+维变成符号的来源：
+
+- 显式：`torch._dynamo.mark_dynamic(x, 0)`，或 `torch.compile(dynamic=True)`
+- 自动：第一次常按静态编；第二次换了长度，守卫失败，Dynamo 把这维升成 `s0` 再编一次（automatic dynamic）
+
+图结构（有哪些算子、谁连谁、几维、dtype）是编译期固定的；**各维有多长**是运行期才填的。
+
+**2. Inductor 对着符号表达式 lowering，kernel 带运行时长度**
+
+IR 里 size 是 `sympy` 表达式，不是常量。生成出来的 kernel 类似：
+
+```text
+kernel(x, y, s0):          # s0 是入参
+    for i in 0..s0:        # 循环上界运行时才知道
+        y[i] = f(x[i])
+grid = cdiv(s0, BLOCK)     # launch 配置也按本次 s0 算
+```
+
+融合、buffer 复用看的是「这两段同长度 / 生命周期不重叠」，用的是符号等式（`s0 == s0`），不依赖具体是 800。昇腾侧关掉 Triton 之后，同样把 `s0` 传给 AscendKernel / NPU 原生算子——这些 API 本来就接受运行时 dim。
+
+**3. 守卫卡住的是结构，不是某个长度**
+
+还要固定、会触发重编的：rank、dtype、device、stride 模式、以及「`if seq > 512:`」这种按具体值走的控制流。  
+不必固定的：token 数、batch 里实际 token 总和。
+
+所以不是「编译突然不需要 shape 了」，而是 **编译需要的是 shape 的结构，不是 shape 的数值**。ACLGraph 把数值也录进去了；Inductor 只把结构编进去，数值当参数。
+
+仍会被迫焊死的情况：某个 NPU 算子没有动态实现、或 Inductor 为了对齐假设了 `s0 % 8 == 0`。之后来了不满足的长度，守卫 miss，再编一份。动态不是无限万能，是把「每个长度一份图」收成「同一结构一份图」。
+
 ## 问题怎么识别
 
 Prefill 动态 shape 跨度极大（几十 token 到几十万）。先试了社区 **Piecewise ACLGraph**：
@@ -98,6 +137,7 @@ Prefill 全面改 `torch.compile` + Inductor（`torch_npu._inductor`），端到
 
 - Inductor 是 `torch.compile` 的编译器后端：收图之后融合/lowering，不是 ACLGraph 那种录制回放。
 - 「动态 shape 捕获」= Dynamo 把会变的维收成符号 `s0`，不是焊死本次长度。编译一次，运行时代入不同 seq。
+- 固定 shape 是 ACLGraph 回放的约束。Inductor 是 codegen：结构固定、长度当 kernel 参数。FakeTensor + SymInt 种符号，lowering 时不把 1024 写进指令。
 - 识别有两层：业务上 piecewise **无收益**；工程上 ACLGraph × 二级流水 **不可用**。后者比「慢」更硬。
 - 实现不是「打开 compile 开关」就完，必须处理 **NPU 原地算子的反函数化** 和 **关掉 Triton / 内存重排**。
 - MTP Prefill 要单独去掉 `enforce_eager`，否则主模型入图、draft 仍 eager。
