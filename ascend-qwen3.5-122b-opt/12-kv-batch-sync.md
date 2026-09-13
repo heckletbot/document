@@ -21,17 +21,43 @@ profiling 结论：
 
 48 层满同步的话，光 sync 墙钟就不可接受。所以问题定义为 **同步粒度太细**，不是传输协议太慢。
 
-## 具体怎么改实现
+## sync 该怎么理解
 
-Prefill 侧加 KV buffer：
+名字里有两个「sync」，不是一回事。
 
-1. 每层 forward 后把 KV **写入 buffer 并立刻返回**，不在该层做 `Event::sync`
-2. 每 N 层才 sync 一次，然后 `batch_transfer_sync_write` 一次送出 N 层 KV
+**`Event.record()`**：在计算 stream 上钉一个章，意思是「stream 执行到这里时，章被盖上」。CPU 立刻返回，NPU 还在往后算。每层都可以 record，本身几乎不挡人。
+
+**`Event.synchronize()` / `aclrtSynchronizeEvent`（这里说的 sync）**：CPU **坐等这枚章被盖上**。章一盖上，说明 record 之前、同一条 stream 上的 kernel 都算完了——对本路径就是「这层 paged KV 已经写进显存，RDMA 可以读」。
+
+它**不是**：
+
+- 等 Decode 收到了
+- 等发送线程和计算线程握手
+- 等网络 ACK
+
+发送线程调用 `wait_event.synchronize()`，语义只是：**在确认本卡这层 KV 写完之前，不准发起 `batch_transfer_sync_write`**。否则 DMA 会读到旧数据。
+
+`batch_transfer_sync_write` 名字里的 sync 是另一件事：这次 RDMA 提交在引擎返回前会卡住调用方。优化砍的是前面那个 **Event sync**，不是改 RDMA 协议。
+
+同 stream 是 FIFO：等第 N 层的 event，等于前 N 层的写 KV 都已经完成。所以可以每层都 record（便宜），但只在第 N 层 `synchronize()` 一次，再把 N 层一起传出去。
 
 ```text
-改前:  layer_i compute → record → sync(4ms) → transfer → layer_{i+1} ...
-改后:  layer_i compute → write buffer → layer_{i+1} ...  (每 N 层才 sync+batch write)
+改前（每层）:
+  layer_i 算完 → record_i → synchronize(event_i)  ← CPU 在这空等 ~4ms
+               → 传 layer_i → 才能安心下发 layer_{i+1}
+
+改后（每 N 层）:
+  layer_i   算完 → 写入 buffer → record_i → 立刻算下一层   （不 synchronize）
+  layer_i+1 算完 → 写入 buffer → record_{i+1} → …
+  layer_i+N 算完 → 写入 buffer → synchronize(event_{i+N})  ← 只等这一次
+               → 一次传这 N 层
 ```
+
+你的理解对的部分：减的是 **synchronize 次数**，不是 record。中间那几层只打点、不等；攒满 N 层再用最后一枚 event 对齐，然后一批送走。CPU 少被掐几次，后面的计算 kernel 才能连着 enqueue——profiling 里 84.4% 的 record→record 间隙，指的就是被这次等待掐断的下发。
+
+## 具体怎么改实现
+
+Prefill 侧加 KV buffer：每层写入后立刻返回，本层不做 `Event::synchronize`；每 N 层才 sync 一次，再 `batch_transfer_sync_write` 一次送出这 N 层。
 
 N 由 `VLLM_CLOUD_KV_BATCH_SIZE` 控制。N 越大，sync 次数越少、下发越连；但 buffer 更大，D 侧看到 KV 的延迟也更批量化（分层 overlap 的窗口变粗）。原实验在不定长并发下 606→531ms。
 
@@ -126,7 +152,8 @@ ret = self.engine.batch_transfer_sync_write(
 
 ## 学习要点
 
+- sync = CPU 等本卡 KV 写完，不是等 Decode 收到。`batch_transfer_sync_write` 是另一次（RDMA）等待。
 - 识别手段是 **Event sync 耗时 + enqueue 间隙占比（84.4%）**，直接指向 host/device 同步，而不是 RDMA 带宽。
-- 实现是 **延迟同步 + 攒层传输**，计算 kernel 不再每层被 sync 卡住。
+- 实现是 **延迟同步 + 攒层传输**：record 仍可每层打，synchronize 改成每 N 层一次。
 - 社区公开实现已经是「计算只 record、发送线程再 sync + batch write」，但 batch 的单位仍是**一层**。`VLLM_CLOUD_KV_BATCH_SIZE` 是在这之上把 sync/write 粒度从 1 层改成 N 层。
 - 和先 P 后 D（[11](11-layerwise-cpcd.md)）正交：那条改调度与首 token 路径，这条改数据面每层 sync 粒度。
