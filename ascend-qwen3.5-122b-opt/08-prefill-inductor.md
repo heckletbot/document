@@ -100,6 +100,28 @@ grid = cdiv(s0, BLOCK)     # launch 配置也按本次 s0 算
 
 仍会被迫焊死的情况：某个 NPU 算子没有动态实现、或 Inductor 为了对齐假设了 `s0 % 8 == 0`。之后来了不满足的长度，守卫 miss，再编一份。动态不是无限万能，是把「每个长度一份图」收成「同一结构一份图」。
 
+## 是不是必须算子先有「动态实现」才能用 Inductor
+
+不是。打开 Inductor **不要求** GPU/NPU 上每个算子都另做一套动态版。分两类：
+
+**Inductor 自己生成的 kernel**（逐点、融合、不少 reduction）  
+动态能力在 codegen 里：`s0` 当参数写进 kernel。不存在「先向厂家要一份动态实现」这一步。GPU 上是 Triton/C++，这里关掉 Triton 后走 AscendKernel，同样按运行时 dim 生成。
+
+**Inductor 调不着、只能调用现成库算子的**（GEMM、FlashAttn、HCCL、`reshape_and_cache`、RoPE…）  
+这些本来就是「调用时传入 m/n/k」的 API，大多数 **eager 就接受运行时长度**，并没有单独的 static/dynamic 两个实现。Inductor 只是在图里把这次的 `s0` 传进去。
+
+会卡住的是第三种：算子内部自己是 **固定 shape 回放**（里面套了 ACLGraph / 只编过一个长度），或符号维 lowering 失败。这时 Inductor 只能：
+
+- 把这维焊死（每个长度一份守卫/一份编译），或
+- graph break，这段回 eager
+
+所以：
+
+- **能用 Inductor**：不依赖「全家都有动态实现」
+- **一整张 Prefill 图都吃动态 shape**：热路径上的库算子必须能按运行时 dim 工作（或 Inductor 能自己生成）。做不到的那截就会特化或掉出图
+
+这篇优化关掉 Triton、走 NPU 原生算子，前提是这些 ACLNN/ATB 接口本身吃运行时 dim。`reshape_and_cache` / RoPE 要改的是原地写语义（反函数化），不是「缺动态版」。
+
 ## 问题怎么识别
 
 Prefill 动态 shape 跨度极大（几十 token 到几十万）。先试了社区 **Piecewise ACLGraph**：
@@ -138,6 +160,7 @@ Prefill 全面改 `torch.compile` + Inductor（`torch_npu._inductor`），端到
 - Inductor 是 `torch.compile` 的编译器后端：收图之后融合/lowering，不是 ACLGraph 那种录制回放。
 - 「动态 shape 捕获」= Dynamo 把会变的维收成符号 `s0`，不是焊死本次长度。编译一次，运行时代入不同 seq。
 - 固定 shape 是 ACLGraph 回放的约束。Inductor 是 codegen：结构固定、长度当 kernel 参数。FakeTensor + SymInt 种符号，lowering 时不把 1024 写进指令。
+- 用 Inductor 不要求每个算子另做动态版。自己生成的 kernel 自带 `s0`；库算子大多本来就吃运行时 dim。只有内部焊死 shape 或 lowering 失败的，才会特化 / graph break。
 - 识别有两层：业务上 piecewise **无收益**；工程上 ACLGraph × 二级流水 **不可用**。后者比「慢」更硬。
 - 实现不是「打开 compile 开关」就完，必须处理 **NPU 原地算子的反函数化** 和 **关掉 Triton / 内存重排**。
 - MTP Prefill 要单独去掉 `enforce_eager`，否则主模型入图、draft 仍 eager。
