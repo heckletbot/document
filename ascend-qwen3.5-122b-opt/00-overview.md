@@ -27,7 +27,7 @@
 - **两类状态物理页必须对齐**：Full Attention 用分页 KV Cache，GDN/Mamba 用 SSM 递归状态（conv + recurrent）。APC 的 `block_size` 被这套对齐锁死 → 细粒度 APC。
 - **GQA 极瘦**：32 Q 头 / 2 KV 头，`head_dim=256`。
 - **线性注意力头**：`linear_num_key_heads=16`，`linear_num_value_heads=64`，`linear_*_head_dim=128`，Conv1D kernel=4。这些 kernel 就是 AscendC 重写对象。
-- **MTP**：draft 头 1 层，投机解码。argmax 前移、MTP 入图、零气泡都挂在这里。
+- **MTP**：draft 头 1 层，投机解码。argmax 前移、MTP 图级编译、零气泡都挂在这里。
 - **Gemma-style RMSNorm + MRoPE 3D**：融合算子（`split_rmsnorm_mrope_gate` 等）的来源。
 - **原生 VL**：ViT 27 层 / hidden 1152，视觉 token 进 LLM prefill。
 
@@ -73,7 +73,7 @@
 RouteServer:  ① 先 P 后 D 分层传输    ⑬ SLO 预测调度
 API Server:   ②③ 首 token / 分词相关（fastokens 等）
 MM Worker:    ④ 视觉 token 稀疏化     ⑤ 预处理下沉     ⑥ ViT 融合
-Prefill:      ⑦ fastokens（编码）     ⑧ Inductor 入图  细粒度 APC
+Prefill:      ⑦ fastokens（编码）     ⑧ Inductor 图级编译  细粒度 APC
 P/D 间:       ⑨ MoE AllGather+ReduceScatter
 Decode:       ⑩ MTP 零气泡            ⑪ ArgMax 前移     ⑫ AscendC
 ```

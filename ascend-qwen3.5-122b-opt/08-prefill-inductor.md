@@ -1,4 +1,4 @@
-# Prefill Inductor 入图
+# Prefill Inductor 图级编译优化
 
 - 链路：主模型 + MTP 的 Prefill 编译
 - 收益：不定长并发下 TTFT ↓ 10ms+（短序列更明显）
@@ -26,20 +26,20 @@ eager 是一算子一 launch。Inductor 把一段 forward 当成一张图优化�
 | 干什么 | 录一段已有算子序列，之后 replay | 真正编译图：融合、codegen、内存规划 |
 | 动态 shape | 基本靠分档（piecewise / bucket） | 符号 shape，同一套产物能吃一档跨度 |
 | 和多 stream | 整段绑在同一 stream 顺序执行 | 不强制单 stream，能和 HCCL overlap 共存 |
-| 「入图」指什么 | 进 replay 图 | 进 `torch.compile` 图 |
+| 图是什么 | 录制后的 replay 图 | `torch.compile` 的 FX 图，用来做编译优化 |
 
-所以「Prefill Inductor 入图」= 把 Prefill 的 forward 交给 Dynamo 收图、Inductor 编译，而不是 eager 逐算子下发，也不是 ACLGraph 回放。
+所以「Prefill Inductor 图级编译优化」= 把 Prefill 的 forward 交给 Dynamo 收成 FX 图，Inductor 在这张图上做融合 / 消冗余 / buffer 规划 / codegen。不是 eager 逐算子下发，也不是 ACLGraph 回放。不用「入图」这个词：它容易听成「录进回放图」。
 
-## 入图怎么理解；优化在不在运行时做
+## 图级编译怎么理解；优化在不在运行时做
 
-**入图** = 这段 forward 不再 eager 一个算子立刻 launch，而是先被收成一张可编译的图。
+**图级编译** = 这段 forward 不再 eager 一个算子立刻 launch，而是先被收成一张 FX 图，再在图上做编译期优化。
 
 ```text
-eager：  op1 launch → op2 launch → op3 launch     （没有图，编译器看不见整段）
-入图：   [op1 → op2 → op3] 收成一张图 → 编译 → 之后按图执行
+eager：      op1 launch → op2 launch → op3 launch     （没有图，编译器看不见整段）
+图级编译：   [op1 → op2 → op3] 收成 FX 图 → Inductor 优化 → 之后按编译产物执行
 ```
 
-这篇里的图是 `torch.compile` 的 FX 图。`fullgraph=True` 表示整条 Prefill forward 都必须留在这张图里，不许中途 graph break 掉回 eager。ACLGraph 的「入图」是另一张东西：录制回放图。
+`fullgraph=True` 表示整条 Prefill forward 都必须留在这张图里，不许中途 graph break 掉回 eager。
 
 **优化在编译期做完**（融合、消冗余、buffer 规划、codegen）。运行期每个请求不做第二遍优化，只是：
 
@@ -190,7 +190,7 @@ Prefill 动态 shape 跨度极大（几十 token 到几十万）。先试了社�
    - `TASK_QUEUE_ENABLE=2`（二级流水）：HCCL 与计算不同 stream overlap  
    - 结果：stream 语义冲突、域错误，Prefill 侧崩溃  
 
-所以要换一条：**能吃动态 shape，又不和多 stream 通信重叠冲突** 的入图。
+所以要换一条：**能吃动态 shape，又不和多 stream 通信重叠冲突** 的图级编译路径。
 
 ## 具体怎么改实现
 
@@ -213,7 +213,7 @@ Prefill 全面改 `torch.compile` + Inductor（`torch_npu._inductor`），端到
 
 ## 学习要点
 
-- 入图 = 把 forward 收成一张图再编译，相对 eager「一算子立刻 launch」。优化在编译期做完；运行期只执行产物 + 守卫，不是每请求再优化。
+- 图级编译 = 把 forward 收成 FX 图，在图上做编译期优化（融合 / 消冗余 / buffer 规划）。运行期只执行产物 + 守卫。不用「入图」，以免理解成 ACLGraph 录制回放。
 - 「动态 shape 捕获」= Dynamo 把会变的维收成符号 `s0`，不是焊死本次长度。编译一次，运行时代入不同 seq。
 - 固定 shape 是 ACLGraph 回放的约束。Inductor 是 codegen：结构固定、长度当 kernel 参数。FakeTensor + SymInt 种符号，lowering 时不把 1024 写进指令。
 - 用 Inductor 不要求每个算子另做动态版。自己生成的 kernel 自带 `s0`；库算子大多本来就吃运行时 dim。只有内部焊死 shape 或 lowering 失败的，才会特化 / graph break。
@@ -221,4 +221,4 @@ Prefill 全面改 `torch.compile` + Inductor（`torch_npu._inductor`），端到
 - 关掉 Triton、改调 NPU 原算子：DCE/CSE 和 buffer reuse 还在；逐点融合成一个 kernel 基本没了，host 下发收益变薄。这篇实际走的是 AscendKernel，不是纯 1:1 fallback。
 - 识别有两层：业务上 piecewise **无收益**；工程上 ACLGraph × 二级流水 **不可用**。后者比「慢」更硬。
 - 实现不是「打开 compile 开关」就完，必须处理 **NPU 原地算子的反函数化** 和 **关掉 Triton / 内存重排**。
-- MTP Prefill 要单独去掉 `enforce_eager`，否则主模型入图、draft 仍 eager。
+- MTP Prefill 要单独去掉 `enforce_eager`，否则主模型走图级编译、draft 仍 eager。
