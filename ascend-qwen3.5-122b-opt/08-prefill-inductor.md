@@ -30,6 +30,24 @@ eager 是一算子一 launch。Inductor 把一段 forward 当成一张图优化�
 
 所以「Prefill Inductor 入图」= 把 Prefill 的 forward 交给 Dynamo 收图、Inductor 编译，而不是 eager 逐算子下发，也不是 ACLGraph 回放。
 
+## 入图怎么理解；优化在不在运行时做
+
+**入图** = 这段 forward 不再 eager 一个算子立刻 launch，而是先被收成一张可编译的图。
+
+```text
+eager：  op1 launch → op2 launch → op3 launch     （没有图，编译器看不见整段）
+入图：   [op1 → op2 → op3] 收成一张图 → 编译 → 之后按图执行
+```
+
+这篇里的图是 `torch.compile` 的 FX 图。`fullgraph=True` 表示整条 Prefill forward 都必须留在这张图里，不许中途 graph break 掉回 eager。ACLGraph 的「入图」是另一张东西：录制回放图。
+
+**优化在编译期做完**（融合、消冗余、buffer 规划、codegen）。运行期每个请求不做第二遍优化，只是：
+
+1. 查守卫：这次的 rank/dtype/动态维还适用这张图吗
+2. 代入本次 `s0`，launch 已经编好的 kernel
+
+不是每个请求现场再融合、再规划内存。首次或守卫 miss 时，编译会发生在服务进程里，那仍是在**做一次编译**，不是运行时优化器。
+
 ## 动态 shape 的捕获是什么
 
 「捕获」是 **Dynamo 的事**，发生在 Inductor 编译之前。第一次（或守卫失败后）跑 Prefill forward 时，Dynamo 跟着 Python 走一遍，把算子收成一张 FX 图，并记下这张图什么时候还能用——这套记录叫 **guard（守卫）**。
@@ -195,7 +213,7 @@ Prefill 全面改 `torch.compile` + Inductor（`torch_npu._inductor`），端到
 
 ## 学习要点
 
-- Inductor 是 `torch.compile` 的编译器后端：收图之后融合/lowering，不是 ACLGraph 那种录制回放。
+- 入图 = 把 forward 收成一张图再编译，相对 eager「一算子立刻 launch」。优化在编译期做完；运行期只执行产物 + 守卫，不是每请求再优化。
 - 「动态 shape 捕获」= Dynamo 把会变的维收成符号 `s0`，不是焊死本次长度。编译一次，运行时代入不同 seq。
 - 固定 shape 是 ACLGraph 回放的约束。Inductor 是 codegen：结构固定、长度当 kernel 参数。FakeTensor + SymInt 种符号，lowering 时不把 1024 写进指令。
 - 用 Inductor 不要求每个算子另做动态版。自己生成的 kernel 自带 `s0`；库算子大多本来就吃运行时 dim。只有内部焊死 shape 或 lowering 失败的，才会特化 / graph break。
