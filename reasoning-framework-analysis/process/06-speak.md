@@ -28,7 +28,7 @@ Profiler 从上往下：框架有没有组成有效 batch、设备有没有 Idle
 2. **观察清单**：模型 / 硬件软件 / 负载 SLO / Serving 切法，见 [02-observe.md](02-observe.md)。
 3. **路径**：Client → Router → Scheduler → Prefill/Decode → 采样；PD 多一跳 KV。见 [03-request-path.md](03-request-path.md)。
 4. **诊断**：四层 Profiling 对五种 Bound。见 [04-diagnose.md](04-diagnose.md)。
-5. **动手**：参数、框架、融合、并行。见 [05-levers.md](05-levers.md)。
+5. **动手**：参数、框架、融合、并行。见 [05-levers.md](05-levers.md)。扫表用 [checklist.md](../checklist.md)。
 
 ---
 

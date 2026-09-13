@@ -10,6 +10,10 @@
 
 ---
 
+**对照清单（先扫表再展开）：** [checklist.md](checklist.md)
+
+---
+
 ## 拿到新模型时怎么走
 
 ```mermaid
@@ -35,6 +39,7 @@ flowchart LR
 
 | 部分 | 文档 | 要能说清什么 |
 |------|------|----------------|
+| 新模型对照清单 | [checklist.md](checklist.md) | 15 个优化点：简表 + 该不该上 + 怎么验收 |
 | 为什么系统看 | [process/01-problem.md](process/01-problem.md) | 瓶颈不在一个 Kernel，变量互相咬 |
 | 新模型观察清单 | [process/02-observe.md](process/02-observe.md) | 模型、硬件、负载、并行，先问哪几个问题 |
 | 请求路径 | [process/03-request-path.md](process/03-request-path.md) | 请求从进到出经过哪些阶段、每段看什么指标 |
