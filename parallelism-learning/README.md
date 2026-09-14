@@ -17,7 +17,7 @@
 | DP | 请求 / batch | 权重完整（或 Attention 完整） | 几乎无；MoE 时要对齐 dummy forward |
 | PP | 层 | 连续若干层 | Send / Recv 激活 |
 | TP | 矩阵 / 头 | 每层都有，权重按列/行切 | AllReduce / AllGather |
-| EP | 专家 | Attention 按 DP/TP，Expert 子集 | AllToAll（或 AllGather + ReduceScatter） |
+| EP | 专家列表（还可再切单个 expert / 复制 MoE 副本） | Attention 按 DP/TP，Expert 子集 | dispatch / combine（A2A 或 AG+RS） |
 | SP | token / seq 维激活 | 同 TP，激活沿序列切开 | ReduceScatter + AllGather |
 | CP | 上下文 / KV 的序列维 | 同 TP（DCP **不增卡**） | AllGather Q/KV，或 ring Send/Recv |
 
@@ -30,7 +30,8 @@
 1. AllReduce 和 ReduceScatter + AllGather 是什么关系？通信量差在哪？
 2. ColumnParallel 和 RowParallel 哪个输入完整、哪个要 AllReduce？MLP 里 gate/up 和 down 各用哪个？
 3. `world_size` 和 `world_size_across_dp` 分别乘了哪些维度？DCP 为什么不在乘法里？
-4. 开 `--enable-expert-parallel` 之后 EP 大小怎么算？Attention 和 Expert 各按什么切？
-5. vLLM 的 SP 改的是权重还是通信图？它和 AsyncTP 谁依赖谁？
-6. MLA 模型 `-tp 8` 为什么会 8 倍复制 KV？`-dcp 8` 增不增加 GPU？
-7. 从 `vllm serve` 到第一层 AllReduce，进程组和线性层分别在哪两个文件里建出来？
+4. 开 `--enable-expert-parallel` 之后 EP 大小怎么算？Attention 和 Expert 各按什么切？vLLM 开 EP 后 `moe_tp` 是几？
+5. `moe_ep_size` / `moe_tp_size` / `moe_dp_size` 各切什么？「TP 会切到 MoE」问的是哪一个？
+6. vLLM 的 SP 改的是权重还是通信图？它和 AsyncTP 谁依赖谁？
+7. MLA 模型 `-tp 8` 为什么会 8 倍复制 KV？`-dcp 8` 增不增加 GPU？
+8. 从 `vllm serve` 到第一层 AllReduce，进程组和线性层分别在哪两个文件里建出来？

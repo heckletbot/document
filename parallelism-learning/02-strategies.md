@@ -147,28 +147,30 @@ MoE 模型：专家层要在 `DP × TP` 范围内同步。任一 rank 还有请�
 
 ## 专家并行 EP
 
-**切什么：** MoE 的专家权重。Attention 仍按 DP/TP；专家按卡切开，每张卡只留一部分 expert。
+**切什么：** MoE 里的 M 个专家均分到 N 张卡，所有卡按专家切分 MoE 权重。Attention 仍按 DP/TP。
 
-vLLM 里 EP 大小不是单独的启动参数，而是算出来的：
+MoE 适合这么切，因为专家权重是参数大头，但每次只激活 top-k 个；各个 expert 是互相独立的 MLP，不必像稠密 FFN 那样把同一份矩阵按列/行切开。
+
+### 效果
+
+单卡塞不下全部 expert 时，分到多卡，**数学上和单卡算完全部 expert 再加权求和等价**，用通信换显存。
+
+Prefill 时 token 多、专家 GEMM 吃得满，多卡并行算不同 expert，等于扩了算力，TTFT 能降。Decode 每步 token 少，通信占比更高，更吃 AllToAll 的延迟。
+
+### 实现（Attention TP/DP + Expert EP）
 
 ```text
-EP_SIZE = TP_SIZE × DP_SIZE
-```
+Attention TP=2，Attention DP=4，共 8 卡，EP=8（无冗余）
 
-`--enable-expert-parallel` 打开后，专家层从「当成 TP 切矩阵」改成「按 expert 切卡」。
-
-```text
-TP=2 DP=4，共 8 卡，EP=8
-
-Attention：4 个 DP 组，每组内 TP=2 切 QKV/O
-Experts：8 张卡分 256 个 expert，每卡 32 个（无冗余时）
+Attention：4 个 DP 组，每组内 TP=2 切 QKV / O
+Experts：256 个 expert 摊到 8 张卡，每卡 32 个完整 expert
 
 Token 路由：
   本卡 hidden + topk_ids
-       │ AllToAll dispatch（按 expert 归属换卡）
+       │ dispatch（按 expert 把 token 送到持有它的卡）
        ▼
   持有该 expert 的卡做 GEMM
-       │ AllToAll / ReduceScatter combine
+       │ combine（结果送回 token 原来的卡）
        ▼
   token 回到原卡，和 Attention 输出对齐
 ```
@@ -179,32 +181,127 @@ flowchart TB
     A0[DP0 TP 组]
     A1[DP1 TP 组]
   end
-  subgraph moe [MoE 按 EP=DP×TP]
+  subgraph moe [MoE 按 EP]
     E0[experts 0-31]
     E1[experts 32-63]
     E2[...]
   end
-  attn -->|AllToAll dispatch| moe
+  attn -->|dispatch| moe
   moe -->|combine| attn
 ```
 
-不开 EP 时，MoE 层会组成大小为 `TP × DP` 的 TP 组，和稠密模型一样切矩阵。对 DeepSeek 这类 MLA + 海量 expert 的模型，EP 局部性更好。
+### 三套通信实现
 
-**通信：** `--all2all-backend` 决定具体原语：
+前向只有两步语义：**dispatch 送出去，combine 收回来**。底下常见三套实现，不是三种切分。
 
-| backend | 实际集合通信 | 更适合 |
-|---------|----------------|--------|
-| `allgather_reducescatter`（默认） | AllGather 收 token，ReduceScatter 送回 | 通吃 |
-| `deepep_high_throughput` | DeepEP 高吞吐 AllToAll | Prefill / PD 的 P |
-| `deepep_low_latency` | DeepEP 低延迟 AllToAll | Decode / PD 的 D |
+| 实现 | 实际集合通信 | 在干什么 | 何时用 |
+|------|----------------|----------|--------|
+| AllToAll | 每个 Rank 按 expert 归属和所有其他 Rank 交换 | 真正的「每人给每人」 | DeepEP / pplx / FlashInfer A2A，大规模 EP |
+| AllGather + ReduceScatter | dispatch 用 AllGather 收齐所有 token；combine 用 ReduceScatter 送回 | 用两步模拟 AllToAll，实现简单 | 默认通吃；hybrid EP+TP 时常走这条 |
+| dispatch / combine 融合核 | 库自己的一对 API，内部仍是 A2A 或 fused | 把 permute + 通信 + 反 permute 焊在一起 | DeepEP、`ascend_fuseep` 等 |
 
-Token 按 expert 分布不均时开 `--enable-eplb`，周期性把热 expert 迁到别的卡（可加冗余 expert）。这是权重搬迁，不是前向主路径。
+AllGather+ReduceScatter 的直观过程（EP=2）：
 
-**效果：**
+```text
+Rank0 的 token 要去 expert 0 和 1
+Rank1 的 token 要去 expert 0 和 1
 
-- 专家权重按卡切开，单卡显存下降，才能把 Attention 做成 DP 复制、把 KV 做大。
-- 代价是每层 MoE 一次 dispatch + combine。Prefill token 多，用高吞吐 backend；Decode token 少，用低延迟 backend。PD 分离时 P/D 可以选不同 backend。
-- `--enable-dbo` 把 AllToAll 和计算重叠，是 EP 上常用的下一刀。
+AllGather：每张卡都拿到全部 token（有一份冗余计算/流量）
+本地只跑自己持有的 expert
+ReduceScatter：按 token 原来的归属把结果加完送回
+```
+
+比真 AllToAll 容易写，流量通常更大。vLLM 默认 `--all2all-backend allgather_reducescatter`；DeepEP 才换成真正的 AllToAll。SGLang 默认 `--moe-a2a-backend none`（AR/AG），`--moe-a2a-backend deepep` 才走 dispatch/combine。
+
+Token 按 expert 分布不均时开 EPLB，周期性把热 expert 迁到别的卡。这是权重搬迁，不是前向主路径。
+
+### TP 会切到 MoE 层吗？
+
+先澄清名字：启动里的 `--tp N` **不等于「MoE 层的 TP」**。在 SGLang 里 `--tp` 是这套副本的 world size（总卡数，不含 PP/外部 DP）；MoE 自己还有三个维度，乘起来要等于这个 world：
+
+```text
+tp_size(world) = moe_ep_size × moe_tp_size × moe_dp_size
+```
+
+| 维度 | 切什么 | 如何设 |
+|------|--------|--------|
+| `moe_ep_size` | experts 列表（`n_experts` 分到 N 个 rank，每 rank 持 `n_experts/ep` 个**完整** expert） | 用户指定（SGLang `--ep-size`） |
+| `moe_tp_size` | **单个** expert 的权重（`W_gate` / `W_up` / `W_down` 再按 intermediate 切） | 自动推导 `= tp / ep / moe_dp` |
+| `moe_dp_size` | MoE 副本（world 切成 N 份独立 MoE，**副本之间不交换 token**） | 用户指定（SGLang `--moe-data-parallel-size`，默认 1） |
+
+所以「TP 会切到 MoE 吗」精确版是：`moe_tp_size` 配成 1 还是 >1？
+
+**配置 A：`moe_tp = 1`（默认，专家多而小）**
+
+每个 expert 完整放在单个 rank 上。MoE 层只有 EP 的 dispatch/combine，没有 AllReduce。
+
+例：DeepSeek-V3（256 experts，单 expert 大约 1.5 GB），`--tp 16 --ep-size 16` → `moe_tp = 16/16/1 = 1`，每 rank 持 16 个完整 expert。
+
+单 expert 往往比 Attention 的 `W_q` 还小，再切一份 TP 收益微小，却多一次 AllReduce。大 MoE 默认不切。
+
+**配置 B：`moe_tp > 1`（专家少而大）**
+
+单 expert 太大，一张卡装不下时，把 expert **内部**按 TP 切，语义和稠密 FFN 的 Column + Row 一样。
+
+例：Mixtral-8×7B（8 个大 expert），`--tp 16 --ep-size 8` → `moe_tp = 2`，每 rank 持 1 个 expert 的一半权重。
+
+MoE 层多一次 **MOE_TP AllReduce**（`_MOE_TP` 组，size = `moe_tp`），FFN 后合并 partial。语义同标准 TP AllReduce，只是组更小。SGLang 里 hybrid EP+TP 目前主要是 `--moe-a2a-backend none` 这条路；DeepEP 一类要求 `ep_size = tp_size`，也就是 `moe_tp = 1`。
+
+判断：看**单 expert 能不能塞进单卡**。多而小（DeepSeek 类）→ `moe_tp=1`；少而大（Mixtral 类）→ `moe_tp>1`。启动后看 `mlp.experts.N.gate_proj.weight.shape`：intermediate 维被除过，就是被 MoE TP 切了。
+
+```text
+moe_tp=1：gate_proj 是 [intermediate, hidden]     完整 expert
+moe_tp=2：gate_proj 是 [intermediate/2, hidden]   列切了
+```
+
+### `moe_dp_size` 是独立参数
+
+`moe_dp_size` **不是**从 attn 的 tp/dp/cp 推出来的，是用户主动选的：`--moe-data-parallel-size N`（默认 1）。语义是「把 world 切成 N 份**独立 MoE 副本**，副本之间不做 EP AllToAll」。
+
+约束（SGLang `server_args.py`）：
+
+- `ep_size × moe_dp_size ≤ tp_size`（`ep_size > 1` 时取等号）
+- `attn_cp_size != moe_dp_size` 时必须 `moe_dp_size == 1`
+
+| 场景 | `moe_dp_size` | 说明 |
+|------|---------------|------|
+| 默认：MoE 全域 EP | 1 | 最常见，专家摊最散 |
+| MoE A2A 带宽紧，复制权重省通信 | `= attn_dp_size` | 副本级 DP，副本间零 A2A |
+| CP + MoE | 保持 1 | CP 的 token 合/切靠 `_MOE_DP` 与 `_ATTN_CP` 别名，不是调这个参数 |
+
+绝大多数部署保持默认 `moe_dp_size = 1`。
+
+### MoE 三个切分参数怎么记
+
+```text
+一张卡上的 MoE 看到什么
+
+  moe_ep_size   我持有哪几个完整 expert          ← 列表切开
+  moe_tp_size   每个 expert 的矩阵还切不切       ← 矩阵切开
+  moe_dp_size   对面那组卡是不是另一份 MoE 副本  ← 请求切开，副本不换 token
+```
+
+| 参数 | 谁设 | 默认 | 主通信 | 一句话 |
+|------|------|------|--------|--------|
+| `moe_ep_size` | 用户 `--ep-size` | 1（等于没开 EP） | dispatch / combine | 专家摊到多卡 |
+| `moe_tp_size` | `tp / ep / moe_dp` 自动除出来 | 通常 1 | 组内 AllReduce | 单个 expert 再切一刀 |
+| `moe_dp_size` | 用户 `--moe-data-parallel-size` | 1 | 副本间无 A2A | 复制一份 MoE，省跨副本通信 |
+
+和 Attention 侧的 `--tp` / `--dp` 不要对号入座：`--tp 16` 是总卡数；Attention 还可以再拆 `attn_tp × attn_dp × attn_cp`。EP 只回答「专家怎么放」，不回答「QKV 怎么切」。
+
+### 启动参数对照（SGLang vs vLLM）
+
+同一套三维，两套 CLI 暴露方式不同。
+
+| 概念 | SGLang | vLLM |
+|------|--------|------|
+| 副本 world | `--tp N`（常等于总卡数） | `world_size = TP × PP × PCP`；`--tensor-parallel-size` **不是**总卡数 |
+| 开 EP | `--ep-size N`（用户指定） | `--enable-expert-parallel`，然后 `EP = TP × DP`，不能单独设 |
+| `moe_tp_size` | `tp/ep/moe_dp`，可以为 >1 | 开 EP 后 **强制 1**（每个 device 持有完整 expert）；不开 EP 则 MoE 整层当 TP 切，所有 expert 每卡都有一份、矩阵按列/行切 |
+| `moe_dp_size` | `--moe-data-parallel-size`，副本间不 A2A | 无同名旋钮。`--data-parallel-size` 开 EP 时是把更多卡并进**同一个** EP 组，rank 之间 **要** 换 token |
+| A2A 实现 | `--moe-a2a-backend`：`none` / `deepep` / … | `--all2all-backend`：`allgather_reducescatter` / `deepep_*` / … |
+
+vLLM 开 EP 之后走的就是上面的配置 A：`moe_tp = 1`。Mixtral 那种「EP 再叠 MoE TP」在 vLLM 里对应的是 **不开** `--enable-expert-parallel`，让 MoE 层组成大小为 `TP × DP` 的 TP 组去切矩阵。
 
 ## 序列并行 SP
 
@@ -304,7 +401,7 @@ Prefill CP 两条路（上游仍在推进）：
       每一层内部：
         Attention 权重按 TP 切（或 DP 复制）
         KV 序列维按 DCP 切
-        MoE 专家按 EP 切（EP = TP × DP）
+        MoE：moe_ep 切专家列表，moe_tp 可选再切单个 expert，moe_dp 复制独立 MoE
         激活 token 维可按 SP 改写 AllReduce
 ```
 
@@ -314,6 +411,7 @@ Prefill CP 两条路（上游仍在推进）：
 |------|------|
 | 单机稠密 70B | `TP=8` |
 | 两机 405B，每机 8 卡 | `TP=8 PP=2` |
-| 单机 DeepSeek-V3，H200×8 | `TP=1 DP=8 --enable-expert-parallel` |
+| 单机 DeepSeek-V3，H200×8 | vLLM：`TP=1 DP=8 --enable-expert-parallel`；SGLang：`--tp 8 --ep-size 8`（`moe_tp=1`） |
+| Mixtral 类少而大的 expert | SGLang：`--tp 16 --ep-size 8`（`moe_tp=2`）；vLLM：不开 EP，让 MoE 走 TP |
 | 同上但要去 KV 复制 | 再加 `-dcp`（MLA 可到 8） |
 | Prefill / Decode 角色分离 | P、D 各自一套 TP/DP/EP；KV 走 Connector，不是这六种之一 |

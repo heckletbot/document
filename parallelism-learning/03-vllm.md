@@ -156,18 +156,34 @@ MoE：`vllm/v1/worker/dp_utils.py` 做「还有没有未完成请求」的 AllRe
 
 ### EP：FusedMoE
 
+三维切分（`moe_ep` / `moe_tp` / `moe_dp`）的概念见 [02-strategies.md](02-strategies.md)。vLLM 的暴露更窄：
+
+```text
+不开 --enable-expert-parallel
+  moe_ep = 1，moe_tp = 展平后的 TP（含 DP）
+  每张卡持有全部 expert，矩阵按列/行切   ← Mixtral 那种「少而大」
+
+打开 --enable-expert-parallel
+  moe_ep = TP × DP，moe_tp = 1
+  每张卡持有一组完整 expert，不再切单个 expert 的矩阵  ← DeepSeek 那种「多而小」
+```
+
+对应 `FusedMoEParallelConfig`：`use_ep=True` 时把 `tp_size` 改写成 1，把原来的 TP rank 当成 EP rank。vLLM **没有** SGLang 那种独立的 `--ep-size` / `--moe-data-parallel-size`。
+
 路径：
 
 ```text
 Router  →  Quantize + dispatch  →  Expert GEMM  →  combine
 ```
 
+dispatch/combine 三套实现都走同一对 API：
+
 | 文件 | 看什么 |
 |------|--------|
 | `vllm/model_executor/layers/fused_moe/modular_kernel.py` | 四段流水 |
 | `vllm/model_executor/layers/fused_moe/all2all_utils.py` | 按 `--all2all-backend` 选 PrepareAndFinalize |
 | `.../prepare_finalize/naive_dp_ep.py` | 默认：`get_ep_group().dispatch` / `combine` = AllGather + ReduceScatter |
-| `vllm/distributed/device_communicators/all2all.py` | DeepEP / FlashInfer / naive 实现 |
+| `vllm/distributed/device_communicators/all2all.py` | DeepEP / FlashInfer 的真 AllToAll |
 
 `--enable-ep-weight-filter`：每张卡磁盘上只读自己那份 expert，大 MoE 加载会快一截。
 
