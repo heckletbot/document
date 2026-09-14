@@ -17,10 +17,36 @@
 
 **切什么：** 同一层的权重矩阵。每张卡都跑全部层，但只持有矩阵的一列块或一行块。
 
-Megatron 风格的一对线性层：
+原理是把 `Y = X @ W` 拆开算。约定：X 是 `[token, in]`，W 是 `[in, out]`，Y 是 `[token, out]`。TP=2。
 
-- `ColumnParallelLinear`：`Y = X @ W`，W 按列切。每张卡用完整 X，算出 Y 的一块。需要完整 Y 时再 AllGather。
-- `RowParallelLinear`：W 按行切。输入已按最后一维切开，各卡算部分和，AllReduce 加成完整 Y。
+**列拆分**（`ColumnParallelLinear`）：W 按**输出维**竖着切成左右两块。
+
+```text
+W = [ W0 | W1 ]          每卡一块列，形状 [in, out/2]
+
+Y  = X @ [ W0 | W1 ]
+   = [ X@W0 | X@W1 ]     每卡用完整 X，算出 Y 的一半
+
+Rank0 持有 W0，得到 Y 的左半；Rank1 持有 W1，得到 Y 的右半。
+输入 X 每张卡都有一份；算完默认不通信。要完整 Y 时再 AllGather。
+```
+
+**行拆分**（`RowParallelLinear`）：W 按**输入维**横着切成上下两块，X 也按最后一维切开。
+
+```text
+W = [ W0 ]               每卡一块行，形状 [in/2, out]
+    [ W1 ]
+
+X = [ X0 | X1 ]
+
+Y  = X0@W0  +  X1@W1     每卡算一份「部分和」，形状都是完整的 [token, out]
+
+Rank0：X0 @ W0
+Rank1：X1 @ W1
+AllReduce 把两份加起来，每张卡都得到完整 Y。
+```
+
+列拆分切的是**输出**，行拆分切的是**输入**。MLP 因此固定成一对：先 Column（gate/up），中间 SiLU 各算各的，再 Row（down）用 AllReduce 拼回去。
 
 ```text
 MLP 一层（TP=2）
