@@ -198,23 +198,170 @@ flowchart TB
 |------|----------------|----------|--------|
 | AllToAll | 每个 Rank 按 expert 归属和所有其他 Rank 交换 | 真正的「每人给每人」 | DeepEP / pplx / FlashInfer A2A，大规模 EP |
 | AllGather + ReduceScatter | dispatch 用 AllGather 收齐所有 token；combine 用 ReduceScatter 送回 | 用两步模拟 AllToAll，实现简单 | 默认通吃；hybrid EP+TP 时常走这条 |
-| dispatch / combine 融合核 | 库自己的一对 API，内部仍是 A2A 或 fused | 把 permute + 通信 + 反 permute 焊在一起 | DeepEP、`ascend_fuseep` 等 |
+| dispatch / combine 融合核 | 库自己的一对 API，内部仍是 A2A | permute + 通信 + 反 permute 焊在一起 | DeepEP、`ascend_fuseep` 等 |
 
-AllGather+ReduceScatter 的直观过程（EP=2）：
+下面共用同一个小例子看数据怎么变。`K>1` 时只是先把 token 复制成 `T×K` 份再走同一条路，combine 回来后按 `topk_weights` 加权加回 `[T, H]`。
 
 ```text
-Rank0 的 token 要去 expert 0 和 1
-Rank1 的 token 要去 expert 0 和 1
+EP=2，4 个 expert，topk=1，每卡 2 个 token，hidden = H
 
-AllGather：每张卡都拿到全部 token（有一份冗余计算/流量）
-本地只跑自己持有的 expert
-ReduceScatter：按 token 原来的归属把结果加完送回
+Rank0 持有 E0、E1     本地 token A、B
+Rank1 持有 E2、E3     本地 token C、D
+
+路由：A→E0（留在 R0）  B→E2（去 R1）  C→E1（去 R0）  D→E3（留在 R1）
 ```
 
-比真 AllToAll 容易写，流量通常更大。vLLM 默认 `--all2all-backend allgather_reducescatter`；DeepEP 才换成真正的 AllToAll。SGLang 默认 `--moe-a2a-backend none`（AR/AG），`--moe-a2a-backend deepep` 才走 dispatch/combine。
+三条路的骨架一样，中间两个算子不同：
+
+```text
+[T, H] 本卡 hidden
+   │  Router（无通信）
+   ▼
+[T, H] + [T, K] topk_ids / topk_weights
+   │  ★ dispatch 算子（三套不一样）
+   ▼
+持有该 expert 的卡上的 token
+   │  本地 grouped GEMM（MoE 计算，无通信）
+   ▼
+expert 输出
+   │  ★ combine 算子（三套不一样）
+   ▼
+[T, H] 回到原卡，和 Attention 残差对齐
+```
+
+#### 1) AllToAll
+
+只把 token 送到「持有被选中 expert 的卡」，没有的不传。
+
+```mermaid
+flowchart LR
+  subgraph r0 [Rank0]
+    H0["A,B  [2,H]"] --> R0[Router]
+    R0 --> D0["AllToAll dispatch"]
+    D0 --> M0["GEMM E0,E1"]
+    M0 --> C0["AllToAll combine"]
+    C0 --> O0["A_out,B_out  [2,H]"]
+  end
+  subgraph r1 [Rank1]
+    H1["C,D  [2,H]"] --> R1[Router]
+    R1 --> D1["AllToAll dispatch"]
+    D1 --> M1["GEMM E2,E3"]
+    M1 --> C1["AllToAll combine"]
+    C1 --> O1["C_out,D_out  [2,H]"]
+  end
+  D0 <-->|"B 去 R1，C 来 R0"| D1
+  C0 <-->|"B_out 回 R0，C_out 回 R1"| C1
+```
+
+```text
+Rank0                         Rank1
+A,B  [2,H]                    C,D  [2,H]
+  │ Router                      │ Router
+  │ A→E0, B→E2                  │ C→E1, D→E3
+  ▼                             ▼
+AllToAll dispatch ─────────────►│
+  │  发出 B，收到 C               │  发出 C，收到 B
+  ▼                             ▼
+A,C  [2,H]                    B,D  [2,H]      ← 按 expert 归属重排
+  │ GEMM E0(A), E1(C)           │ GEMM E2(B), E3(D)
+  ▼                             ▼
+A_out, C_out                  B_out, D_out
+  │ AllToAll combine ◄──────────│
+  │  发出 C_out，收到 B_out      │  发出 B_out，收到 C_out
+  ▼                             ▼
+A_out, B_out  [2,H]           C_out, D_out  [2,H]
+```
+
+通信量 ≈ 跨卡 token 数 × H，跟路由有关。本例只有 B、C 过网。
+
+#### 2) AllGather + ReduceScatter
+
+先让每张卡都拿到全部 token，本地只跑自己的 expert，再按原归属规约切回去。实现简单，多一份冗余流量。
+
+```mermaid
+flowchart LR
+  subgraph r0 [Rank0]
+    H0["A,B  [2,H]"] --> R0[Router]
+    R0 --> G0["AllGather"]
+    G0 --> M0["GEMM E0,E1<br/>其余位置填 0"]
+    M0 --> S0["ReduceScatter"]
+    S0 --> O0["A_out,B_out  [2,H]"]
+  end
+  subgraph r1 [Rank1]
+    H1["C,D  [2,H]"] --> R1[Router]
+    R1 --> G1["AllGather"]
+    G1 --> M1["GEMM E2,E3<br/>其余位置填 0"]
+    M1 --> S1["ReduceScatter"]
+    S1 --> O1["C_out,D_out  [2,H]"]
+  end
+  G0 <-->|"每卡都得到 A,B,C,D"| G1
+  S0 <-->|"按 2+2 切开，对应位置相加"| S1
+```
+
+```text
+Rank0                              Rank1
+A,B  [2,H]                         C,D  [2,H]
+  │ Router                           │ Router
+  ▼                                  ▼
+AllGather ──────────────────────────►│
+  ▼                                  ▼
+A,B,C,D  [4,H]                     A,B,C,D  [4,H]     ← 每卡一份完整 token
+  │ GEMM 只跑 E0、E1                  │ GEMM 只跑 E2、E3
+  │ 其余位置 0                        │ 其余位置 0
+  ▼                                  ▼
+[A_out, 0, C_out, 0]               [0, B_out, 0, D_out]   都是 [4,H]
+  │ ReduceScatter（按 [2,2] 切开相加） │
+  ▼                                  ▼
+[A_out+0, 0+B_out]                 [C_out+0, 0+D_out]
+= A_out, B_out  [2,H]              = C_out, D_out  [2,H]
+```
+
+B 的计算发生在 Rank1，但 ReduceScatter 之后结果回到 Rank0。AllGather 的体积是 `全局 T × H`，和「有没有跨卡路由」无关，所以通常比 AllToAll 更胖。
+
+vLLM 默认 `--all2all-backend allgather_reducescatter` 就是这一套。SGLang `--moe-a2a-backend none` 类似，dispatch 用 AllGather 或 AllReduce。
+
+#### 3) dispatch / combine 融合核
+
+语义等于 AllToAll，多做一步 **按 expert 把 token 排成连续块**，好喂 grouped GEMM。DeepEP 的 `dispatch()` / `combine()`、`ascend_fuseep` 都是这个接口。
+
+```mermaid
+flowchart LR
+  H["本卡 hidden  [T,H]"] --> R[Router]
+  R --> P["permute：按 expert id 把 token 排好"]
+  P --> D["fused dispatch<br/>内部 AllToAll"]
+  D --> M["grouped GEMM<br/>E0 一段、E1 一段"]
+  M --> C["fused combine<br/>内部 AllToAll"]
+  C --> U["unpermute：按原 token 序还原"]
+  U --> O["本卡输出  [T,H]"]
+```
+
+```text
+Rank0  [2,H]  A,B
+  │ Router          A→E0, B→E2
+  │ permute         本地先按目标 expert 分组
+  ▼
+fused dispatch（内部 AllToAll，可带量化）
+  ▼
+Rank0 收到给 E0、E1 的 token，在缓冲里连续排着：
+  E0 段: A          E1 段: C          layout = [n_local_experts, max_tokens, H]
+  │ grouped GEMM    一段 expert 一次矩阵乘，不用再 scatter
+  ▼
+  E0 段: A_out      E1 段: C_out
+  │ fused combine（内部 AllToAll + unpermute）
+  ▼
+Rank0  [2,H]  A_out, B_out     ← 已经变回原 token 顺序
+```
+
+两种常见 layout：
+
+| layout | 谁用 | 数据长什么样 |
+|--------|------|----------------|
+| continuous（高吞吐） | Prefill / DeepEP HT | token 紧挨着排，长度随路由变 |
+| masked / batched（低延迟） | Decode / DeepEP LL | 每个 expert 预留固定槽位，空的 mask 掉，好进 CUDA Graph |
+
+和裸 AllToAll 的差别不在集合通信原语，而在 **permute 焊进通信**，计算侧拿到的就是 grouped GEMM 要的布局。
 
 Token 按 expert 分布不均时开 EPLB，周期性把热 expert 迁到别的卡。这是权重搬迁，不是前向主路径。
-
 ### TP 会切到 MoE 层吗？
 
 先澄清名字：启动里的 `--tp N` **不等于「MoE 层的 TP」**。在 SGLang 里 `--tp` 是这套副本的 world size（总卡数，不含 PP/外部 DP）；MoE 自己还有三个维度，乘起来要等于这个 world：
