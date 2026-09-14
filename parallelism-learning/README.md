@@ -21,7 +21,7 @@
 | SP | token / seq 维激活 | 同 TP，激活沿序列切开 | ReduceScatter + AllGather |
 | CP | 上下文 / KV 的序列维 | 同 TP（DCP **不增卡**） | AllGather Q/KV，或 ring Send/Recv |
 
-选策略的粗规则：单卡装得下就别切；单机装不下先 TP；跨节点或没 NVLink 再叠 PP；要吞吐就叠 DP；MoE 用 DP Attention + EP；长上下文 decode 显存不够再开 DCP。
+选策略的粗规则：单卡装得下就别切；单机装不下先量化再 TP；大 MoE 用 DP Attention + EP；长上下文 decode 显存不够再开 DCP。PP 通信轻但 decode 空泡重，量化后基本不用，只留给没 NVLink 或仍然装不下的超大稠密模型。
 
 ## 自我验证
 

@@ -82,7 +82,7 @@ flowchart LR
 
 - 单卡装不下权重时的第一刀。单机多卡、有 NVLink，优先 TP。
 - TP 越大，每卡算力越碎，通信次数不减。GQA / MLA 的 KV 头很少，TP 超过头数后 KV 会在多卡上复制，显存白花。
-- 官方经验：先加到「KV cache 行数 / 并发」够用；跨节点再叠 PP，而不是无脑把 TP 拉到集群总卡数。
+- 官方经验：先加到「KV cache 行数 / 并发」够用。量化后仍单机装不下、或没 NVLink 时才叠 PP，不要无脑把 TP 拉到集群总卡数。
 
 ## 流水并行 PP
 
@@ -113,12 +113,22 @@ sequenceDiagram
 
 **通信：** 阶段之间是点对点 Send / Recv，不是 AllReduce。体积是一份 hidden（加 residual），比 TP 每层 AllReduce 轻，所以没 NVLink、跨节点时 PP 往往比纯 TP 更划算。最后一阶段要把采样 token 广播回前面各 stage，下一轮才能继续。
 
-**效果：**
+**效果：** 对通信要求低（相对 TP），换到的是「层能拆到多卡上装得下」。
 
-- 单机卡数除不尽、或卡之间没有 NVLink（例如 L40S）：官方建议 `TP=1, PP=卡数`。
-- 跨节点经典配方：`TP = 每节点卡数`，`PP = 节点数`。
-- Decode 每步只有 1 个 token，流水线很难填满，气泡明显。推理里 PP 主要换的是「装得下」，不是 decode 延迟。Prefill 大 batch 时微批可以掩盖一部分气泡。
+**空泡：** batch 小的时候很明显。流水线要前面 stage 算完才能 Send，后面 stage 只能等。Decode 每步 1 个 token，每段算力极薄，微批填不满，气泡接近 `(PP-1)/PP`。Prefill 大 batch 用微批能盖住一部分，decode 盖不住。所以 PP 不降 TPOT，只换显存。
 
+**现在推理为什么基本不用：**
+
+- 权重量化（FP8 / W8A8 / INT4）把权重显存砍到 1/2～1/4
+- 卡的 HBM 越来越大（80GB → 140GB+），70B、甚至量化后的更大稠密模型单机 TP 就装得下
+- 大 MoE 更走 DP Attention + EP，不靠按层切
+
+所以当前部署默认是 **能量化 + TP/EP 就不要开 PP**。还值得用 PP 的只剩少数情况：没 NVLink 的卡（L40S 一类，官方会建议 `TP=1, PP=卡数`）、量化后仍然单机装不下的超大稠密模型、跨节点还想把 TP 留在节点内。
+
+```text
+更常见：量化 + TP（+ MoE 的 EP）   ← 通信是层内 AllReduce / A2A，但没有流水线气泡
+更少见：PP 跨层 Send/Recv         ← 通信轻，decode 气泡重
+```
 ## 数据并行 DP
 
 **切什么：** 请求。每张卡（或每个 TP 组）持有同一份 Attention 权重，独立 KV cache，各自跑自己的 batch。
@@ -557,7 +567,7 @@ Prefill CP 两条路（上游仍在推进）：
 | 场景 | 配方 |
 |------|------|
 | 单机稠密 70B | `TP=8` |
-| 两机 405B，每机 8 卡 | `TP=8 PP=2` |
+| 两机 405B 且量化后仍装不下 | `TP=8 PP=2`（现在更少见） |
 | 单机 DeepSeek-V3，H200×8 | vLLM：`TP=1 DP=8 --enable-expert-parallel`；SGLang：`--tp 8 --ep-size 8`（`moe_tp=1`） |
 | Mixtral 类少而大的 expert | SGLang：`--tp 16 --ep-size 8`（`moe_tp=2`）；vLLM：不开 EP，让 MoE 走 TP |
 | 同上但要去 KV 复制 | 再加 `-dcp`（MLA 可到 8） |

@@ -245,7 +245,7 @@ PP 叠在外面：本 stage 算完上述一整段后，Send hidden 到下一 sta
 | 策略 | 主要换到什么 | 典型代价 | 何时会变慢 |
 |------|--------------|----------|------------|
 | TP | 单卡放得下权重；decode 多卡算一层 | 每层 AllReduce | TP 过大、GQA 头已切光还在复制 KV；跨节点无 NVLink |
-| PP | 层数 × 权重跨节点 | Send/Recv 激活；decode 气泡 | 单机有 NVLink 时硬用 PP，延迟往往差过 TP |
+| PP | 层拆开装得下；跨节点/无 NVLink | Send/Recv 轻；decode 空泡重 | 量化后单机已能装下时还开 PP，TPOT 往往差过纯 TP |
 | DP | 吞吐近线性；每 rank 一份 KV | 调度、MoE dummy | 负载不均、prefix cache 被打散 |
 | EP | 专家局部性、Attention 可 DP | 每层 AllToAll | backend 和 P/D 阶段不匹配；expert 热度倾斜（没 EPLB） |
 | SP | 大 batch 时 Norm/通信可重叠 | 小 batch 额外切分 | token 数低于阈值仍强制开 |
@@ -261,8 +261,8 @@ PP 叠在外面：本 stage 算完上述一整段后，Send hidden 到下一 sta
     → 加 TP，直到 KV 行数 / 并发够
 GQA/MLA 开始复制 KV
     → 加 DCP，范围 [1, tp/H_kv]
-单机仍装不下，或无 NVLink
-    → 加 PP（跨节点：TP=每节点卡数，PP=节点数）
+单机仍装不下（量化之后），或无 NVLink
+    → 才加 PP（跨节点：TP=每节点卡数，PP=节点数）
 要吞吐而不是单请求延迟
     → 加 DP（MoE 再加 --enable-expert-parallel）
 ```
