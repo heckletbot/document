@@ -131,104 +131,228 @@ sequenceDiagram
 ```
 ## 数据并行 DP
 
-**切什么：** 请求。每张卡（或每个 TP 组）持有同一份权重，Attention 权重和 KV cache 都独立。每个 DP 组服务不同请求，**前向互不通信**。
+**切什么：** 请求。每张卡（或每个 TP 组）持有同一份权重，Attention 权重和 KV cache 都独立。每个 DP 组服务不同请求，**稠密模型前向互不通信**。
 
 ```text
 DP=2 TP=2，共 4 卡
 
         DP rank0                    DP rank1
-     TP0        TP1              TP0        TP1
-   同一份权重  同左切矩阵         再复制一份  同左切矩阵
+     GPU0       GPU1             GPU2       GPU3
+   同一份权重  TP 切矩阵          再复制一份  TP 切矩阵
    独立 KV                      独立 KV
    请求 1,3                     请求 2,4
-   前向不跟右边说话              前向不跟左边说话
 ```
 
-**效果：** 吞吐按 rank 数近似线性扩，实现非常简单——复制模型、把请求分流即可。不增加单请求算力，不降低 TTFT。单条长请求仍然要靠 TP / CP。
+**效果：** 吞吐按 rank 数近似线性扩。实现是复制引擎 + 把请求分流，模型图不用改。不增加单请求算力，不降低 TTFT。单条长请求仍然要靠 TP / CP。
 
-每个 DP rank 一份独立 KV，相同前缀打到同一 rank 才能吃到 APC。`--max-num-seqs` 是 **每个 DP rank** 的上限；`--max-num-queued-reqs` 是整机。
+每个 DP rank 一份独立 KV，相同前缀打到同一 rank 才能吃到 APC。`--max-num-seqs` 是 **每个 DP rank** 的上限；`--max-num-queued-reqs` 是整机（API Server 按全局在途数限流）。
 
-### vLLM 怎么实现
+### 进程和 GPU 怎么切
 
-稠密模型里，DP **不是一层算子**，是「起 N 份独立引擎」。`--data-parallel-size 2 --tensor-parallel-size 2` 长成：
+`--data-parallel-size DP --tensor-parallel-size TP` 时：
+
+| 进程 | 数量 | 干什么 |
+|------|------|--------|
+| API Server | 默认约等于 DP，可用 `--api-server-count` 改 | HTTP、分词、选 rank |
+| EngineCore | = DP | 每个 rank 自己的 scheduler + KV |
+| GPU Worker | = DP × TP × PP × PCP | 真正占卡、跑 forward |
+| DPCoordinator | DP>1 时 1 个（rank0 拉起） | 广播队列长度；MoE 才协调 wave |
+
+GPU 编号在 Worker 里算，不是 NCCL 切出来的：
 
 ```text
-API Server
-    │ ZMQ（控制面，不是 NCCL）
-    │ DPLBAsyncMPClient 挑一个 engine
-    ▼
-EngineCore_DP0          EngineCore_DP1          ← 各一份 scheduler + KV
-    │                       │
- Worker×TP                  Worker×TP            ← 组内若 TP>1 才有 AllReduce
+# vllm/v1/worker/gpu_worker.py  init_device
+tp_pp = pipeline_parallel_size * tensor_parallel_size
+self.local_rank += data_parallel_rank_local * tp_pp
+self.device = cuda:{self.local_rank}
+
+例：DP=2 TP=2
+  DP0 的 TP0/TP1 → cuda:0 / cuda:1
+  DP1 的 TP0/TP1 → cuda:2 / cuda:3
 ```
 
-```mermaid
-flowchart TB
-  Q[请求] --> API[API Server]
-  API --> LB["DPLBAsyncMPClient<br/>score = waiting×4 + running"]
-  LB -->|ZMQ ADD| E0[EngineCore DP0]
-  LB -->|ZMQ ADD| E1[EngineCore DP1]
-  E0 --> W0["GPU workers<br/>本 DP 组内 TP"]
-  E1 --> W1["GPU workers<br/>本 DP 组内 TP"]
-  W0 --> O0[本 rank 输出]
-  W1 --> O1[本 rank 输出]
+每个 EngineCore 底下的 `MultiprocExecutor.world_size = TP×PP×PCP`，**不含 DP**。所以 DP 组之间根本不在同一个 `init_process_group` 里（稠密路径还会把本进程的 `data_parallel_size` 改回 1）。
+
+### 三种分流模式
+
+| 模式 | 怎么起 | 谁选 rank |
+|------|--------|-----------|
+| Internal LB（默认） | 一条 `vllm serve --data-parallel-size N` | API Server 里的 `DPLBAsyncMPClient` |
+| Hybrid LB | 每节点自己的 API Server + `--data-parallel-hybrid-lb` | 节点内 LB，节点之间靠上游 Ingress |
+| External LB | 每个 rank 一次 `vllm serve --data-parallel-rank i --port ...` | 外部路由器；稠密模型甚至可以不起 DP 参数、直接多实例 |
+
+Internal 是「一份 HTTP 入口、多份引擎」。External 是「每份引擎一个端口」。
+
+### 启动：具体方法
+
+入口 `vllm/v1/engine/utils.py` 的 `launch_core_engines`：
+
+```text
+1. 读 ParallelConfig
+     dp_size              = --data-parallel-size
+     local_engine_count   = --data-parallel-size-local（单机默认 = dp_size）
+     dp_rank / start_index= --data-parallel-rank / --data-parallel-start-rank
+
+2. DP>1 且在线服务且本进程是 rank0
+     → 起 DPCoordinator
+     → 填 ZMQ 地址：coordinator_input / coordinator_output / frontend_stats_publish_address
+
+3. 建 handshake ROUTER socket（IPC 或 TCP）
+
+4. CoreEngineProcManager 按 local_engine_count fork 子进程
+     每个子进程 target = EngineCoreProc.run_engine_core
+     kwargs: dp_rank=global_index, local_dp_rank=local_index
+
+5. wait_for_engine_startup
+     每个 EngineCore 连上 handshake，报到 READY
+     前端把 input/output ZMQ 地址发回去
+     EngineCore 再去连这些 socket，进入 busy loop
 ```
 
-启动时每个 DP rank 一个进程。稠密模型直接当成 `DP=1` 的独立 `EngineCore`，MoE 才走会互相同步的 `DPEngineCoreProc`：
+子进程里的分叉（`vllm/v1/engine/core.py`）：
 
 ```python
-# vllm/v1/engine/core.py  EngineCoreProc.run_engine_core
+# EngineCoreProc.run_engine_core
 parallel_config.data_parallel_index = dp_rank
 if data_parallel and vllm_config.model_config.is_moe:
     parallel_config.data_parallel_rank = dp_rank
-    engine_core = DPEngineCoreProc(*args, **kwargs)   # MoE：要对齐 dummy forward
+    engine_core = DPEngineCoreProc(...)      # 建 DP process group，要对齐
 else:
-    # Non-MoE DP ranks are completely independent, so treat like DP=1.
     parallel_config.reconfigure_for_independent_dp_rank()
-    engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+    engine_core = EngineCoreProc(...)        # 当成 DP=1，完全独立
+engine_core.run_busy_loop()
 ```
 
-请求进哪个 rank，由 API Server 侧负载均衡决定，不是集合通信：
+稠密走 else：`reconfigure_for_independent_dp_rank()` 把本进程的 `data_parallel_size/rank` 改成 1/0，后面 `init_distributed_environment` 只拉本 TP 组。`data_parallel_index` 仍保留，用来选 GPU、打日志。
+
+MoE 走 `DPEngineCoreProc._init_data_parallel`：
 
 ```python
-# vllm/v1/engine/core_client.py  DPLBAsyncMPClient.get_core_engine_for_request
-waiting, running = current_counts[idx]
-score = waiting * 4 + running   # 队列越短越好
-# 选 score 最小的 EngineCore，ZMQ 把请求打过去
+dp_group, dp_store = parallel_config.stateless_init_dp_group(return_store=True)
+self.dp_group, self.dp_store = dp_group, dp_store
 ```
 
-`DPCoordinator`（`vllm/v1/engine/coordinator.py`）只做两件事：把各 engine 的 waiting/running 广播给前端；MoE 时发 `START_DP_WAVE` 让空闲 rank 跟一次 dummy forward。稠密模型前向用不到它做 NCCL。
+这才有跨 DP rank 的 Gloo/NCCL 组，后面 dummy forward、`sync_dp_state` 用它。
 
-| 文件 | 看什么 |
-|------|--------|
-| `vllm/v1/engine/utils.py` `launch_core_engines` | 按 `data_parallel_size` 拉起 N 个 EngineCore |
-| `vllm/v1/engine/core.py` `run_engine_core` | 稠密走独立 `EngineCoreProc`，MoE 走 `DPEngineCoreProc` |
-| `vllm/v1/engine/core_client.py` `DPLBAsyncMPClient` | `score = waiting×4 + running` 选 rank |
-| `vllm/v1/engine/coordinator.py` `DPCoordinator` | 队列统计；MoE 才协调 wave |
-| `vllm/v1/executor/multiproc_executor.py` | **每个** DP rank 自己的 Worker，`world_size = TP×PP×PCP`，不含 DP |
+### 一次请求怎么走
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as API Server
+    participant LB as DPLBAsyncMPClient
+    participant Coord as DPCoordinator
+    participant E0 as EngineCore DP0
+    participant E1 as EngineCore DP1
+    participant W as GPU Workers
+
+    C->>API: HTTP /v1/completions
+    API->>API: 校验、分词，做成 EngineCoreRequest
+    Coord-->>LB: 各 engine 的 waiting/running（约 100ms）
+    API->>LB: get_core_engine_for_request
+    Note over LB: score = waiting×4 + running<br/>选最小的
+    LB->>E1: ZMQ ADD
+    E1->>E1: scheduler.schedule()
+    E1->>W: execute_model（本 DP 组）
+    W-->>E1: SamplerOutput
+    E1-->>API: ZMQ EngineCoreOutputs
+    API-->>C: token 流
+```
+
+选 rank 的具体方法（`DPLBAsyncMPClient.get_core_engine_for_request`）：
+
+```python
+if request.data_parallel_rank is not None:
+    eng_index = request.data_parallel_rank          # 调用方钉死
+else:
+    min_score, eng_index = inf, 0
+    for i in range(num_engines):
+        idx = (eng_start_index + i) % num_engines  # 多个 API Server 错开起点
+        waiting, running = current_counts[idx]
+        score = waiting * 4 + running              # 排队权重大于在跑
+        if score < min_score:
+            min_score, eng_index = score, idx
+    current_counts[eng_index][0] += client_count   # 本地先加上，等下次 coordinator 刷新
+chosen = core_engines[eng_index]
+reqs_in_flight[request_id] = chosen                # abort 必须打回同一 engine
+```
+
+`waiting×4` 的意思：宁愿打到「在跑但队列空」的 rank，也不打到「队列已经堆起来」的 rank。Coordinator 大约每 100ms 用各 EngineCore 上报的 `SchedulerStats` 刷新这份表。
+
+EngineCore 接到 ADD 之后和单副本一样：
+
+```text
+_process_input_queue  → scheduler.add_request
+_process_engine_step  → scheduler.schedule()
+                      → executor.execute_model()     # 只动本 DP 组的 GPU
+                      → 采样 token，ZMQ 回前端
+```
+
+稠密的 `EngineCoreProc.run_busy_loop` 没有「等别的 rank」这一步。本 rank 没请求就 `input_queue.get()` 睡着，有请求再 step。
+
+### MoE 才多出来的对齐（不是稠密 DP）
+
+专家层 AllToAll 要求所有 DP rank 同时 forward。空闲 rank 必须跑 `execute_dummy_batch()`。方法在 `DPEngineCoreProc.run_busy_loop`：
+
+```text
+每步：
+  1. 处理 ZMQ 输入（ADD / START_DP_WAVE / abort）
+  2. _process_engine_step()；若本 rank 没可跑的请求
+        → execute_dummy_batch()          # 空 batch 也走一遍 MoE 通信
+  3. 每 32 步一次 ParallelConfig.sync_dp_state(dp_group)
+        → 2 元 AllReduce：[有没有未完成请求, 是否都要 pause]
+        → 全 idle 则 wave += 1，暂停循环
+  4. 新请求来了，Coordinator 广播 START_DP_WAVE，空闲 rank 再醒
+```
+
+```python
+# vllm/config/parallel.py  ParallelConfig.sync_dp_state
+# 一次 SUM all-reduce，两个 int：
+# [0] 本 rank 有未完成 → 全局 OR
+# [1] 本 rank pending_pause → 全局全 1 才算 pause 共识
+```
+
+这才是跨 DP 的 GPU 集合通信，而且只为了 EP 对齐。稠密路径根本不建 `dp_group`。
+
+### 代码索引
+
+| 步骤 | 文件 / 方法 |
+|------|-------------|
+| 拉起 N 个引擎、handshake | `vllm/v1/engine/utils.py` `launch_core_engines` / `CoreEngineProcManager` |
+| 稠密 vs MoE 分叉 | `vllm/v1/engine/core.py` `EngineCoreProc.run_engine_core` |
+| 稠密 busy loop | 同文件 `EngineCoreProc.run_busy_loop` |
+| MoE dummy + wave | 同文件 `DPEngineCoreProc.run_busy_loop` / `_has_global_unfinished_reqs` |
+| 选 rank | `vllm/v1/engine/core_client.py` `DPLBAsyncMPClient.get_core_engine_for_request` |
+| 队列广播、START_DP_WAVE | `vllm/v1/engine/coordinator.py` `DPCoordinator` |
+| GPU 编号 | `vllm/v1/worker/gpu_worker.py` `init_device` |
+| 每 rank 的 Worker | `vllm/v1/executor/multiproc_executor.py`（`world_size` 不含 DP） |
+| MoE 对齐 AllReduce | `vllm/config/parallel.py` `sync_dp_state` / `has_unfinished_dp` |
 
 ### 用了什么算子
 
-稠密 DP **没有** DP 专用集合通信算子。模型层还是普通 Linear（组内若 `TP>1`，仍是 `ColumnParallelLinear` / `RowParallelLinear` 的 AllReduce，那是 TP，不是 DP）。
+稠密 DP **没有** DP 专用集合通信算子，模型层不出现 `get_dp_group().all_reduce`。
 
-| 阶段 | 算子 / 机制 | 走哪 |
-|------|-------------|------|
-| 分流请求 | 看 waiting/running，ZMQ `ADD` | CPU 控制面 |
-| 本 rank 前向 | 普通 GEMM；组内 TP 才 AllReduce | GPU，不跨 DP |
-| 回包 | ZMQ 把 token 送回 API Server | CPU 控制面 |
+| 阶段 | 方法 | 实际算子 | 走哪 |
+|------|------|----------|------|
+| 分流 | `get_core_engine_for_request` | 无；比 waiting/running | CPU |
+| 下发 | ZMQ `ADD` | 无 | 本机 IPC / TCP |
+| 本 rank 前向 | `execute_model` | GEMM；组内 TP 才 `AllReduce` | 本 DP 组 GPU |
+| 回包 | ZMQ `EngineCoreOutputs` | 无 | CPU |
+| MoE 空转（仅 MoE） | `execute_dummy_batch` | 与真 batch 相同的 EP dispatch/combine | 跨 DP GPU |
+| MoE 是否结束（仅 MoE） | `sync_dp_state` | 每 32 步一次 2-int `AllReduce` | `dp_group` |
 
 ### 通信
 
-**跨 DP 组：0 集合通信。** Rank 之间不 AllReduce、不 AllGather、不传激活、不传 KV。权重各自加载一份，KV 各自一份，前向各算各的。
+**稠密：跨 DP 组集合通信 = 0。** 不 AllReduce、不 AllGather、不传激活、不传 KV。权重各自从盘加载一份，KV 各自一份。
 
-控制面有 ZMQ（API Server ↔ EngineCore），那不是 GPU 卡间 NCCL，不算「DP 通信开销」。
+控制面有 ZMQ（API Server ↔ EngineCore、EngineCore ↔ Coordinator）。这是 CPU 消息，不是卡间 NCCL，不进 DP 通信开销。
 
-唯一要加限定的是 **MoE**：专家层要在 `DP×TP` 范围内对齐，空闲 rank 跟 dummy forward，这时才有 AllToAll / AllGather。那是 EP 的通信，挂在 DP 拓扑上，不是稠密 DP 本身。
+组内若 `TP>1`，仍有 TP 的 AllReduce，但只发生在 `cuda:0↔cuda:1` 这种同一 DP 组里，到不了另一组。
 
 ```text
-稠密 DP：  请求分流（ZMQ） + 各 rank 独立前向     → 跨卡 NCCL = 0
-DP + TP：  上式，外加每个 DP 组内部的 TP AllReduce → 跨 DP 组仍是 0
-DP + EP：  专家层要换 token                         → 这时才有跨 DP 的集合通信
+稠密 DP：     ZMQ 分流 + 各 rank 独立前向              → 跨 DP NCCL = 0
+DP + TP：     上式 + 每个 DP 组内部的 TP AllReduce     → 跨 DP 仍是 0
+DP + MoE/EP： dummy batch + 每 32 步 sync_dp_state     → 这时才有跨 DP 集合通信
 ```
 
 ## 专家并行 EP

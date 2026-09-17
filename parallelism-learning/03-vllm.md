@@ -150,15 +150,34 @@ last rank:   RMSNorm + lm_head
 
 ### DP：调度而不是层
 
-稠密 DP 没有模型层分支。`run_engine_core` 把每个 rank 重配成独立的 `EngineCoreProc`（`reconfigure_for_independent_dp_rank()`），前向跨 DP 组零 NCCL。概念和流程图见 [02-strategies.md](02-strategies.md)。
+稠密 DP 没有模型层分支，详细逐步方法见 [02-strategies.md](02-strategies.md)。这里只钉文件：
 
 ```text
-launch_core_engines          → EngineCore × DP
-DPLBAsyncMPClient            → score = waiting×4 + running，ZMQ 把请求打到一个 engine
-MultiprocExecutor            → 每个 engine 自己的 Worker，world_size 不含 DP
+launch_core_engines
+    CoreEngineProcManager  fork  EngineCore × DP
+    handshake ROUTER 发 ZMQ input/output 地址
+    rank0 起 DPCoordinator
+
+run_engine_core
+    稠密: reconfigure_for_independent_dp_rank() → EngineCoreProc
+          init_distributed_environment 只含本 TP 组
+    MoE:  DPEngineCoreProc._init_data_parallel()
+          stateless_init_dp_group() 才有跨 rank 的 dp_group
+
+DPLBAsyncMPClient.get_core_engine_for_request
+    score = waiting×4 + running，ZMQ ADD 到选中的 engine
+
+gpu_worker.init_device
+    local_rank += data_parallel_rank_local * TP * PP
+    cuda:{local_rank}
+
+DPEngineCoreProc.run_busy_loop（仅 MoE）
+    空闲 → execute_dummy_batch
+    每 32 步 sync_dp_state：2-int AllReduce
+    全 idle → wave++，等 START_DP_WAVE
 ```
 
-MoE 才换 `DPEngineCoreProc`：`vllm/v1/worker/dp_utils.py` 做「还有没有未完成请求」的 AllReduce；Coordinator 发 `START_DP_WAVE` 让空闲 rank 跟 dummy forward。那是 EP 对齐，不是稠密 DP。
+稠密跨 DP 组零 NCCL。MoE 的 dummy / `sync_dp_state` 是 EP 对齐，不是稠密 DP。
 
 ### EP：FusedMoE
 
