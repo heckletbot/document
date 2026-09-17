@@ -14,7 +14,7 @@
 
 | 策略 | 切什么 | 每张卡上的模型 | 主通信 |
 |------|--------|----------------|--------|
-| DP | 请求 / batch | 权重完整（或 Attention 完整） | 几乎无；MoE 时要对齐 dummy forward |
+| DP | 请求 / batch | 权重完整（每 DP 组一份） | 跨 DP 组 0 NCCL；MoE 时才有 EP 对齐 |
 | PP | 层 | 连续若干层 | Send / Recv 激活 |
 | TP | 矩阵 / 头 | 每层都有，权重按列/行切 | AllReduce / AllGather |
 | EP | 专家列表（还可再切单个 expert / 复制 MoE 副本） | Attention 按 DP/TP，Expert 子集 | dispatch / combine（A2A 或 AG+RS） |

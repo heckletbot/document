@@ -131,29 +131,105 @@ sequenceDiagram
 ```
 ## 数据并行 DP
 
-**切什么：** 请求。每张卡（或每个 TP 组）持有同一份 Attention 权重，独立 KV cache，各自跑自己的 batch。
+**切什么：** 请求。每张卡（或每个 TP 组）持有同一份权重，Attention 权重和 KV cache 都独立。每个 DP 组服务不同请求，**前向互不通信**。
 
 ```text
 DP=2 TP=2，共 4 卡
 
         DP rank0                    DP rank1
      TP0        TP1              TP0        TP1
-   replica A  replica A        replica B  replica B
-   请求 1,3   同左切权重         请求 2,4   同左切权重
+   同一份权重  同左切矩阵         再复制一份  同左切矩阵
    独立 KV                      独立 KV
+   请求 1,3                     请求 2,4
+   前向不跟右边说话              前向不跟左边说话
 ```
 
-稠密模型：DP rank 之间前向互不通信，入口把请求分出去就行。
+**效果：** 吞吐按 rank 数近似线性扩，实现非常简单——复制模型、把请求分流即可。不增加单请求算力，不降低 TTFT。单条长请求仍然要靠 TP / CP。
 
-MoE 模型：专家层要在 `DP × TP` 范围内同步。任一 rank 还有请求在跑，空闲 rank 必须跟一次 dummy forward，否则 AllToAll / AllGather 对不齐。vLLM 用独立的 DP Coordinator 做这件事。
+每个 DP rank 一份独立 KV，相同前缀打到同一 rank 才能吃到 APC。`--max-num-seqs` 是 **每个 DP rank** 的上限；`--max-num-queued-reqs` 是整机。
 
-**通信：** 稠密几乎为零。MoE 时专家层走 EP 或「把 MoE 当成更大的 TP」。调度侧用 ZMQ，不算 NCCL 集合通信。
+### vLLM 怎么实现
 
-**效果：**
+稠密模型里，DP **不是一层算子**，是「起 N 份独立引擎」。`--data-parallel-size 2 --tensor-parallel-size 2` 长成：
 
-- 吞吐按 rank 数近似线性扩，前提是负载均衡和 prefix cache 命中。每个 DP rank 一份独立 KV，相同前缀打到同一 rank 才能吃到 APC。
-- `--max-num-seqs` 是 **每个 DP rank** 的上限；`--max-num-queued-reqs` 是整机。DP=4 时如果队列上限仍按单 rank 来设，会提前拒请求。
-- 不增加单请求算力，不降低 TTFT。单条长请求仍然要靠 TP / CP。
+```text
+API Server
+    │ ZMQ（控制面，不是 NCCL）
+    │ DPLBAsyncMPClient 挑一个 engine
+    ▼
+EngineCore_DP0          EngineCore_DP1          ← 各一份 scheduler + KV
+    │                       │
+ Worker×TP                  Worker×TP            ← 组内若 TP>1 才有 AllReduce
+```
+
+```mermaid
+flowchart TB
+  Q[请求] --> API[API Server]
+  API --> LB["DPLBAsyncMPClient<br/>score = waiting×4 + running"]
+  LB -->|ZMQ ADD| E0[EngineCore DP0]
+  LB -->|ZMQ ADD| E1[EngineCore DP1]
+  E0 --> W0["GPU workers<br/>本 DP 组内 TP"]
+  E1 --> W1["GPU workers<br/>本 DP 组内 TP"]
+  W0 --> O0[本 rank 输出]
+  W1 --> O1[本 rank 输出]
+```
+
+启动时每个 DP rank 一个进程。稠密模型直接当成 `DP=1` 的独立 `EngineCore`，MoE 才走会互相同步的 `DPEngineCoreProc`：
+
+```python
+# vllm/v1/engine/core.py  EngineCoreProc.run_engine_core
+parallel_config.data_parallel_index = dp_rank
+if data_parallel and vllm_config.model_config.is_moe:
+    parallel_config.data_parallel_rank = dp_rank
+    engine_core = DPEngineCoreProc(*args, **kwargs)   # MoE：要对齐 dummy forward
+else:
+    # Non-MoE DP ranks are completely independent, so treat like DP=1.
+    parallel_config.reconfigure_for_independent_dp_rank()
+    engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+```
+
+请求进哪个 rank，由 API Server 侧负载均衡决定，不是集合通信：
+
+```python
+# vllm/v1/engine/core_client.py  DPLBAsyncMPClient.get_core_engine_for_request
+waiting, running = current_counts[idx]
+score = waiting * 4 + running   # 队列越短越好
+# 选 score 最小的 EngineCore，ZMQ 把请求打过去
+```
+
+`DPCoordinator`（`vllm/v1/engine/coordinator.py`）只做两件事：把各 engine 的 waiting/running 广播给前端；MoE 时发 `START_DP_WAVE` 让空闲 rank 跟一次 dummy forward。稠密模型前向用不到它做 NCCL。
+
+| 文件 | 看什么 |
+|------|--------|
+| `vllm/v1/engine/utils.py` `launch_core_engines` | 按 `data_parallel_size` 拉起 N 个 EngineCore |
+| `vllm/v1/engine/core.py` `run_engine_core` | 稠密走独立 `EngineCoreProc`，MoE 走 `DPEngineCoreProc` |
+| `vllm/v1/engine/core_client.py` `DPLBAsyncMPClient` | `score = waiting×4 + running` 选 rank |
+| `vllm/v1/engine/coordinator.py` `DPCoordinator` | 队列统计；MoE 才协调 wave |
+| `vllm/v1/executor/multiproc_executor.py` | **每个** DP rank 自己的 Worker，`world_size = TP×PP×PCP`，不含 DP |
+
+### 用了什么算子
+
+稠密 DP **没有** DP 专用集合通信算子。模型层还是普通 Linear（组内若 `TP>1`，仍是 `ColumnParallelLinear` / `RowParallelLinear` 的 AllReduce，那是 TP，不是 DP）。
+
+| 阶段 | 算子 / 机制 | 走哪 |
+|------|-------------|------|
+| 分流请求 | 看 waiting/running，ZMQ `ADD` | CPU 控制面 |
+| 本 rank 前向 | 普通 GEMM；组内 TP 才 AllReduce | GPU，不跨 DP |
+| 回包 | ZMQ 把 token 送回 API Server | CPU 控制面 |
+
+### 通信
+
+**跨 DP 组：0 集合通信。** Rank 之间不 AllReduce、不 AllGather、不传激活、不传 KV。权重各自加载一份，KV 各自一份，前向各算各的。
+
+控制面有 ZMQ（API Server ↔ EngineCore），那不是 GPU 卡间 NCCL，不算「DP 通信开销」。
+
+唯一要加限定的是 **MoE**：专家层要在 `DP×TP` 范围内对齐，空闲 rank 跟 dummy forward，这时才有 AllToAll / AllGather。那是 EP 的通信，挂在 DP 拓扑上，不是稠密 DP 本身。
+
+```text
+稠密 DP：  请求分流（ZMQ） + 各 rank 独立前向     → 跨卡 NCCL = 0
+DP + TP：  上式，外加每个 DP 组内部的 TP AllReduce → 跨 DP 组仍是 0
+DP + EP：  专家层要换 token                         → 这时才有跨 DP 的集合通信
+```
 
 ## 专家并行 EP
 
