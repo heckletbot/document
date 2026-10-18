@@ -112,15 +112,4 @@
 
 ---
 
-## 自测题
-
-1. `VLLM_USE_V2_MODEL_RUNNER` 不设置时，默认跑哪个 runner？依据是哪一行？
-2. 哪两个特性会**无视**用户设的 `=0` 强行走 V2？两者在「用户设了 0」时的反应有什么不同？
-3. 为什么没装 Triton 就必须回退 V1？MRV2 的哪些子系统是 Triton 写的？
-4. `use_v2_model_runner` 和 `_validate_v2_model_runner()` 的区别是什么？什么时候用户会看到报错而不是静默降级？
-5. `_make_model_runner()` 在 V2 分支下有两个可能的类，分别在什么条件下被选中？
-6. 不看实现，只看 `ls vllm/v1/worker/gpu/sample/`，你能列出 MRV2 支持哪些采样特性吗？
-7. `spec_decode/__init__.py` 的 `init_speculator()` 一共分派出多少种 speculator？哪一种需要额外传 `req_states`，为什么？
-8. `model_states/` 为什么要按模型族分文件？列出其中三个文件各自对应的模型类型。
-9. 说出三个「V1 不支持、只有 V2 有」的特性。
-10. 线上只给你一段启动日志，你怎么判断它跑的是 V1 还是 V2？
+这一章产出的「子包 → 特性」表，在第 12 章会被用来对照 V1 把同样的逻辑放在了哪里。

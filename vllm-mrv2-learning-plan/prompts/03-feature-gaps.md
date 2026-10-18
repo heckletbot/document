@@ -116,15 +116,4 @@ rg -n "_get_v2_model_runner_unsupported_features" -A 40 vllm/config/vllm.py
 
 ---
 
-## 自测题
-
-1. V2 的不支持清单和 V1 的不支持清单，分别写在哪个函数里？各自命中后的后果是什么（回退 vs 报错）？
-2. 为什么 PP + `external_launcher` 在 V2 上还不行？缺的是哪个机制？
-3. EAGLE 的 parallel drafting 在 V2 不支持，为什么 DFlash 和 DSpark 却可以？
-4. 「异构词表 draft 模型」缺的是什么东西？
-5. `use_ubatching` 开启时，V2 的不支持清单为什么会突然变长？
-6. 说出三个「V1 不支持、必须用 V2」的特性，并指出其中哪一个在 V1 上是**静默退化**而不是报错。
-7. 为什么社区选择禁用「V1 + PP + 异步调度」而不是修它？
-8. 自适应验证（adaptive verification）有哪三条互斥约束？各自的原因是什么？
-9. batch-sharded sampling 的 blockers 有哪几条？为什么 TP=1 时它没意义？
-10. 要往 MRV2 迁一个新特性，设计文档要求你先回答什么问题？列出至少三条。
+这一章得到的缺口清单是「还没搬过去的」。第 13 章会反过来问：已经搬过去的那些特性，在 V1 和 V2 里各自要动多少地方。
