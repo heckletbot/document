@@ -1,51 +1,127 @@
-# 持久批与输入准备
+# Persistent batch 和 input preparation
 
-V1 的持久行就是本步要喂给模型的行，所以中间有请求结束就必须把后面的行挪下来，block table 也按这个顺序整段拷上 GPU。V2 让行号在请求活着期间不变，本步的顺序只存在于 `idx_mapping`，再按它 gather。
+代码版本：[vLLM `e80b6c6`](https://github.com/vllm-project/vllm/commit/e80b6c642f21fd5b24439825592f5b9ced36add8)。
 
-## 行号
+Persistent batch 是跨 step 保存的请求状态。V1 把这批 tensor 直接当作这一 step 的 model input，所以 row 必须紧凑、顺序必须对。V2 把两件事拆开：`RequestState` 里每个 request 占一个固定 slot；这一 step 的 model input 是另组的 `InputBatch`，用 `idx_mapping` 从 slot 里 gather 出来。
 
-V1 的 [`remove_request`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu_input_batch.py#L523-L532) 注释要求调用后必须 `condense()`。[`condense`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu_input_batch.py#L698-L706) 把非空请求滑到低位空槽。换行时 [`swap_states`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu_input_batch.py#L580-L587) 要搬 token 前缀，[`condense` 里](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu_input_batch.py#L809-L811) 还把 `generators` 从旧下标挪到新下标。block table 跟着 [`move_row` / `swap_row`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/block_table.py#L137-L151)，在 numpy 上拷一行。持久行会被覆盖，所以另外有一份 [`CachedRequestState`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu_input_batch.py#L35-L74)。
+## 为什么 V1 要 `condense`
 
-V2 的槽位是 [`req_id_to_index` / `free_indices`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/states.py#L28-L30)。[`add_request`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/states.py#L91-L102) 从 `free_indices` 取一个下标，[`remove_request`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/states.py#L127-L134) 还回去。没有 `condense`，也没有 `CachedRequestState`。
+Attention 读的就是 persistent batch 里 block table 的前 `num_reqs` 行。中间一个 request 结束，这一行空了，后面的 request 还停在原下标，和 model input 对不上。所以要把后面的 row 往前挪。
+
+[`remove_request`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu_input_batch.py#L523-L532) 的 docstring 要求调用后必须再调 `condense()`。[`condense`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu_input_batch.py#L698-L730) 做的事：从高位找非空 request，填进低位的空槽。跟着搬的有：
+
+- [`swap_states`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu_input_batch.py#L580-L587)：交换两个下标上的 token 前缀
+- 同一次 `condense` 里把 `generators[旧下标]` 改挂到新下标（[第 809–811 行](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu_input_batch.py#L809-L811)）
+- [`BlockTable.move_row`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/block_table.py#L137-L146)：在 numpy 上把一行 block id 拷到目标 row，源 row 清零
+
+Row 会被别的 request 盖掉，所以 V1 另存一份 [`CachedRequestState`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu_input_batch.py#L35-L74)。
+
+## V2 的 slot 不挪
+
+[`RequestState`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/states.py#L28-L30) 用 `req_id_to_index` 和 `free_indices` 管 slot。[`add_request`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/states.py#L99-L102) / [`remove_request`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/states.py#L127-L134)：
 
 ```python
 req_idx = self.free_indices.pop()
 self.req_id_to_index[req_id] = req_idx
+self.index_to_req_id[req_idx] = req_id
 ```
 
-抢占和结束走同一条删除。[`finish_requests`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/model_runner.py#L1165-L1176) 把 `preempted_req_ids` 并进 `finished_req_ids` 再逐个 `_remove_request`。恢复时重新 `add_request`，`free_indices.pop()` 给出的是当时的空槽，不一定是原来那一行。
+```python
+req_idx = self.req_id_to_index.pop(req_id, None)
+if req_idx is None:
+    return None
+self.index_to_req_id.pop(req_idx, None)
+self.free_indices.append(req_idx)
+return req_idx
+```
 
-本步顺序由 [`sort_batch_req_ids`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/model_runner.py#L2456-L2468) 在 CPU 上排：有草稿的在前，再按 token 数。排的是本步的 req id 列表，不改 `RequestState` 的行。
+没有 `condense`，也没有 `CachedRequestState`。
 
-V2 有三层。[`RequestState`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/states.py) 跨步。[`InputBuffers`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/input_batch.py#L19-L35) 按 `max_num_tokens` 预分配、每步重填。[`InputBatch`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/input_batch.py#L38-L50) 是每步新建的 dataclass，`idx_mapping[batch_idx] = req_state_idx`。
+Preempt 和正常结束走同一条删除。[`finish_requests`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/model_runner.py#L1165-L1176) 把 `preempted_req_ids` 并进 `finished_req_ids`，再对每个 id 调 `_remove_request`。这个 request 再次被调度时重新 `add_request`，拿到的是当时 `free_indices` 里的空 slot。
 
-## 写入
+这一 step 里 request 的先后由 [`sort_batch_req_ids`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/model_runner.py#L2456-L2468) 在 CPU 上排：带 draft token 的在前，再按 token 数。它排的是 req id 列表，不改 `RequestState`。
 
-V1 的 [`CpuGpuBuffer`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/utils.py#L110-L143)：`cpu` 默认 pinned，另有同形状的 `gpu`。`copy_to_gpu(n)` 拷前 n 行。block table 的 [`commit_block_table`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/block_table.py#L181-L190) 就是这一下，然后 `get_device_tensor` 把 `gpu[:num_reqs]` 直接交给注意力。行序必须和模型输入一致，这是 `condense` 存在的原因。
+这一 step 用到的三块数据：
 
-V2 的 [`StagedWriteTensor.apply_write`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/buffer_utils.py#L196-L211) 只打包本步 `stage_write` 记下的下标、起点和内容，再进 `_apply_write_kernel`。block table 的 [`append_block_ids`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/block_table.py#L111-L144) 对每一组调用 `stage_write`；一组时 `apply_write()`，多组时 `FusedStagedWriter.apply` 一次 kernel。基张量默认在 GPU（`StagedWriteTensor` 里 `uva_instead_of_gpu=False` 时 `torch.zeros(..., device=device)`）。
+| 名字 | 生命周期 | 作用 |
+|------|----------|------|
+| [`RequestState`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/states.py) | 跨 step | 每个 request 一个 slot |
+| [`InputBuffers`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/input_batch.py#L19-L35) | 进程内复用 | 按 `max_num_tokens` 预分配的 GPU buffer，每 step 重写 |
+| [`InputBatch`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/input_batch.py#L38-L50) | 只活一个 step | `idx_mapping[batch 下标] = slot` |
 
-交给注意力的是另一张表。[`gather_block_tables`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/block_table.py#L146-L176) 用 `idx_mapping` 做下标，grid 是 `(num_kv_cache_groups, num_rows)`：
+## 状态怎么写到 GPU
+
+V1 只有 [`CpuGpuBuffer`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/utils.py#L139-L143)。`copy_to_gpu(n)` 拷前 n 行，不管这一 step 改了几格：
+
+```python
+def copy_to_gpu(self, n: int | None = None) -> torch.Tensor:
+    cpu, gpu = self.cpu, self.gpu
+    if n is not None:
+        cpu, gpu = cpu[:n], gpu[:n]
+    return gpu.copy_(cpu.pin_memory() if PIN_MEMORY else cpu, non_blocking=True)
+```
+
+Block table 的提交就是这一下，然后把同一张 GPU tensor 的前 n 行交给 attention（[`block_table.py`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/block_table.py#L181-L190)）：
+
+```python
+def commit_block_table(self, num_reqs: int) -> None:
+    self.block_table.copy_to_gpu(num_reqs)
+
+def get_device_tensor(self, num_reqs: int) -> torch.Tensor:
+    return self.block_table.gpu[:num_reqs]
+```
+
+V2 的 block table 不整表拷。[`append_block_ids`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/block_table.py#L111-L130) 对每个 KV cache group 调 `stage_write(slot, start, block_ids)`，只记下这一 step 新加的 block id。[`apply_staged_writes`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/block_table.py#L132-L144)：一个 group 时调 `apply_write()`；多个 group 时用 `FusedStagedWriter.apply`，一次 kernel 写完。
+
+`apply_write` 本身约 40 行（[`buffer_utils.py` 第 196 行起](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/buffer_utils.py#L196-L211)）。它做三步：把暂存的 row 下标、起点、内容打成三段连续 buffer；拷上 GPU；`_apply_write_kernel` 按这三段写回基 tensor。基 tensor 默认就在 GPU 上（`uva_instead_of_gpu=False` 时 `torch.zeros(..., device=device)`）。
+
+Attention 不读这张基 tensor。[`gather_block_tables`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/block_table.py#L165-L176) 按 `idx_mapping` 把 slot 上的行拷到这一 step 的 output。Grid 是 `(KV cache group 数, row 数)`：
 
 ```python
 _gather_block_tables_kernel[(self.num_kv_cache_groups, num_rows)](
     idx_mapping,
     self.block_table_ptrs,
     out_ptrs,
-    ...
+    self.block_table_strides,
+    self.num_blocks.gpu,
+    self.num_blocks.gpu.stride(0),
+    num_reqs,
+    BLOCK_SIZE=1024,
 )
 ```
 
-小列用 [`UvaBackedTensor`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/buffer_utils.py#L109-L128)：真值 `cpu` 是 `pin_memory=False`，`copy_to_uva` 拷进 `UvaBufferPool` 的下一个 pinned 槽。`prompt_len` / `prefill_len` 是这种。[`states.py` 的注释](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/states.py#L43-L51) 写明 `prefill_len` 可以包含抢占前已经生成、恢复时重算的 token，所以 `prefill_len >= prompt_len`；prompt logprobs 和 frequency penalty 必须分开用。
+`prompt_len`、`prefill_len` 用 [`UvaBackedTensor`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/buffer_utils.py#L109-L124)。CPU 上的那份不 pin，每 step 拷进 pool 里的下一个 pinned buffer，GPU 读那一份：
 
-`all_token_ids` 形状是 `(max_num_reqs, max_model_len)`，构造时 `uva_instead_of_gpu=not use_dense_all_token_ids`。注释说 ngram 会反复扫活跃行，所以那种情况改放 GPU。[`buffer_utils.py` 第 19–20 行](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/buffer_utils.py#L19-L26) 要求轮转深度不少于在途 step 数；[`GPUModelRunner.__init__`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/model_runner.py#L242) 传入的是 `vllm_config.max_concurrent_batches`（异步且 V2 时为 `pp_size + 1`，见 [`max_concurrent_batches`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/config/vllm.py#L578-L588)），函数里再和 2 取最大。
+```python
+self.cpu = torch.zeros(size, dtype=dtype, device="cpu", pin_memory=False)
+self.np = self.cpu.numpy()
+self.pool = UvaBufferPool(size, dtype, max_concurrency)
+```
 
-## 本步输入
+`prompt_len` 是用户 prompt 的 token 数。`prefill_len` 是送进 model runner 的 token 数，可以包含 preempt 之前已经生成、恢复时要重算的 token，所以 `prefill_len >= prompt_len`。Prompt logprobs 和 frequency penalty 要用 `prompt_len` 把 prompt 和 output 分开。这段 distinction 写在 [`states.py` 第 43–51 行](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/states.py#L43-L51) 的注释里。
 
-V1 在 [`_prepare_inputs`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu_model_runner.py#L1915) 里用 numpy 拼，再 H2D。上一步采出的 token 要回到 CPU，对应 [`InputBatch.update_async_output_token_ids`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu_input_batch.py#L1038-L1046)。
+`all_token_ids` 的形状是 `(max_num_reqs, max_model_len)`。构造时 `uva_instead_of_gpu=not use_dense_all_token_ids`（[第 37–42 行](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/states.py#L37-L42)）：默认让 GPU kernel 直接读 CPU 内存。Ngram 要反复扫这些 row，才改放到 GPU。
 
-V2 的 prefill 段在 [`_prepare_prefill_inputs_kernel`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/input_batch.py#L272-L303)：`program_id(0)` 是 batch 行，经 `idx_mapping` 找到 `req_state_idx`，从 `all_token_ids` 的那一行把 token 写入 `input_ids`。`all_token_ids` 走 UVA 时，这个指针就是 CPU 内存的 accelerator view。
+Pool 的槽数在 [`GPUModelRunner.__init__`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/model_runner.py#L242) 里设成 `max_concurrent_batches`，[`set_default_max_concurrency`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/buffer_utils.py#L24-L26) 再和 2 取最大。V2 且 async scheduling 时，`max_concurrent_batches` 等于 `pp_size + 1`（[`vllm.py` 第 578–588 行](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/config/vllm.py#L578-L588)）。
 
-decode 段在 [`_combine_sampled_and_draft_tokens_kernel`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/input_batch.py#L407-L464)。`seq_len > prefill_len` 时，把 `last_sampled_tokens[req_state_idx]` 和 `draft_tokens` 写进 `input_ids`。这两个张量都在 GPU 上，这个 kernel 不把它们读回 CPU。
+## 这一 step 的 `input_ids` 从哪来
 
-`query_start_loc` 的前缀和仍在 [`prepare_inputs`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/model_runner.py#L1438-L1448) 里用 numpy 算，因为选 CUDA graph、做 padding 发生在 kernel 之前。`num_computed_tokens` 同时有 GPU 上的 `StagedWriteTensor` 和 numpy 镜像，[`states.py` 第 64 行](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/states.py#L64-L65) 把 numpy 那份标成 GPU 值的上界。
+V1 的 [`_prepare_inputs`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu_model_runner.py#L1915) 有三百多行，在 CPU 上用 numpy 拼 `input_ids`、`positions`、`query_start_loc`，再 H2D。Async scheduling 下，上一步 sample 出的 token 还在 GPU 上，要先拷回 CPU 才能拼进下一步。这个回填是 [`update_async_output_token_ids`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu_input_batch.py#L1038-L1042)，docstring 写的是：等 sampled token 拷完，再写进 `sampling_metadata.output_token_ids`。
+
+V2 的 prefill 段是 [`_prepare_prefill_inputs_kernel`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/input_batch.py#L272-L303)，约 30 行。每个 program 处理 batch 里的一个 request：
+
+1. `idx_mapping[batch_idx]` 得到 slot。
+2. 读这个 slot 的 `prefill_len` 和 `num_computed`。`num_computed >= prefill_len` 就返回。
+3. 从 `all_token_ids[slot]` 的 `num_computed` 处取出这一 step 的 query，写入 `input_ids`。
+
+Decode 段是 [`_combine_sampled_and_draft_tokens_kernel`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/input_batch.py#L407-L464)，约 60 行。`seq_len <= prefill_len` 时直接返回。否则：
+
+1. 用 `idx_mapping` 找到 slot。
+2. 把 `last_sampled_tokens[slot]` 写入 `input_ids` 里这条 logits 的起点。
+3. 若有 draft token，从 `draft_tokens[slot]` 写入 `input_ids` 的末尾。
+
+`last_sampled_tokens` 和 `draft_tokens` 都是 GPU tensor。这个 kernel 不把它们读回 CPU。
+
+`query_start_loc` 的前缀和仍在 [`prepare_inputs`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/model_runner.py#L1438-L1448) 里用 numpy 算。选 CUDA graph 和 padding 发生在这些 kernel 之前，CPU 需要这个前缀和。
+
+`num_computed_tokens` 有两份。[`states.py` 第 61–65 行](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/states.py#L61-L65)：GPU 上的 `StagedWriteTensor` 是实际值；旁边的 numpy 数组注释写的是这份 GPU 值的 upper bound，给 CPU 做调度用。
