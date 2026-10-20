@@ -5,7 +5,7 @@
 | 文档 | 内容 |
 |------|------|
 | [docs/01-overview.md](docs/01-overview.md) | 三处差别，以及什么配置走 V2 |
-| [docs/02-persistent-batch.md](docs/02-persistent-batch.md) | Persistent batch、`condense`、`StagedWriteTensor`、`input_ids` 怎么填 |
+| [docs/02-persistent-batch.md](docs/02-persistent-batch.md) | Persistent batch：`condense` 与 `idx_mapping`，以及 `input_ids` 怎么填 |
 | [docs/03-async.md](docs/03-async.md) | `synchronize_input_prep`、`AsyncOutput`、CUDA graph |
 | [docs/04-sampler.md](docs/04-sampler.md) | `expand_batch_to_tokens`、`expanded_idx_mapping`、`ModelState` |
 
