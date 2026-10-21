@@ -7,7 +7,7 @@
 | [docs/01-overview.md](docs/01-overview.md) | 三处差别，以及什么配置走 V2 |
 | [docs/02-persistent-batch.md](docs/02-persistent-batch.md) | Persistent batch：`condense` 与 `idx_mapping`，以及 `input_ids` 怎么填 |
 | [docs/03-async.md](docs/03-async.md) | 异步调度：batch queue 优先排下一批，V1 的 `synchronize`，V2 的 `UvaBufferPool` |
-| [docs/04-sampler.md](docs/04-sampler.md) | `expand_batch_to_tokens`、`expanded_idx_mapping`、`ModelState` |
-| [docs/05-gpu-native-inputs.md](docs/05-gpu-native-inputs.md) | 准备输入和处理输出用到的 Triton kernel、代码位置，以及 `all_token_ids` 怎么走 UVA |
+| [docs/04-sampler.md](docs/04-sampler.md) | Sampler：参数放进 slot，V1 和 V2 的 7 处不同，为什么换成 Triton，以及 Triton 算子表 |
+| [docs/05-other-features.md](docs/05-other-features.md) | V2 其他特性：GPU 上准备输入和 UVA、模块拆分、`dummy_run`、`CudaGraphManager`、融合多步 draft 解码 |
 
 `prompts/` 是提问稿。正文以 `docs/` 为准。
