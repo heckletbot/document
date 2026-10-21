@@ -6,7 +6,7 @@
 |------|------|
 | [docs/01-overview.md](docs/01-overview.md) | 三处差别，以及什么配置走 V2 |
 | [docs/02-persistent-batch.md](docs/02-persistent-batch.md) | Persistent batch：`condense` 与 `idx_mapping`，以及 `input_ids` 怎么填 |
-| [docs/03-async.md](docs/03-async.md) | `synchronize_input_prep`、`AsyncOutput`、CUDA graph |
+| [docs/03-async.md](docs/03-async.md) | 异步调度：batch queue 优先排下一批，V1 的 `synchronize`，V2 的 `UvaBufferPool` |
 | [docs/04-sampler.md](docs/04-sampler.md) | `expand_batch_to_tokens`、`expanded_idx_mapping`、`ModelState` |
 
 `prompts/` 是提问稿。正文以 `docs/` 为准。
