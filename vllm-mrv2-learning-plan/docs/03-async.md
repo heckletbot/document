@@ -247,3 +247,116 @@ def async_output_busy_loop(self):
 ```
 
 下一批拼 `input_ids` 也不用等这次 D2H。上一步 sample 出的 token 在 GPU 的 `last_sampled_tokens` 里，kernel 按 slot 读。见 [persistent batch](02-persistent-batch.md)。
+
+## Staged write tensor
+
+### V1
+
+V1 的 block table 有两份，一份在 CPU，一份在 GPU。CPU 那份用 numpy 改。每一步把 CPU 上前 `num_reqs` 行整段复制到 GPU，attention 读 GPU 上的这前 n 行。这一步只改了几个格子，没改的行也会再拷一遍。
+
+[`commit_block_table`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/block_table.py#L181-L190) 和 [`copy_to_gpu`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/utils.py#L139-L143)：
+
+```python
+def commit_block_table(self, num_reqs: int) -> None:
+    self.block_table.copy_to_gpu(num_reqs)
+    # 这一步只追加了几个 block id，仍然把前 num_reqs 行整段拷上 GPU。
+
+def get_device_tensor(self, num_reqs: int) -> torch.Tensor:
+    return self.block_table.gpu[:num_reqs]
+    # attention 读 GPU 上的这前 n 行。
+
+def copy_to_gpu(self, n=None):
+    cpu, gpu = self.cpu, self.gpu
+    if n is not None:
+        cpu, gpu = cpu[:n], gpu[:n]
+    return gpu.copy_(cpu.pin_memory() if PIN_MEMORY else cpu, non_blocking=True)
+    # cpu 是 CPU 上的整张表，gpu 是 GPU 上的整张表。这里拷的是前 n 行。
+```
+
+```mermaid
+flowchart LR
+  cpu["CPU 上的 block table"] --> copy["每步拷前 num_reqs 行"]
+  copy --> gpu["GPU 上的 block table"]
+  gpu --> attn["attention 读前 n 行"]
+```
+
+### V2
+
+V2 的 block table 只放在 GPU 上，CPU 不留整张表。这一步新加的 block id 先记在四个 Python list 里，再由一个 kernel 写进 GPU 那张表的对应位置。旧的 block id 还在原处，不会被整表覆盖。这个函数里没有 `synchronize()`。
+
+[`StagedWriteTensor`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/buffer_utils.py#L156-L227)。block table 创建时 `uva_instead_of_gpu=False`，所以这张表在 GPU 上：
+
+```python
+self.gpu = torch.zeros(size, dtype=dtype, device=device)
+# GPU 上的 block table。创建之后一直用这一张。
+
+def stage_write(self, index, start, x):
+    if not x:
+        return
+    self._staged_write_indices.append(index)
+    self._staged_write_starts.append(start)
+    self._staged_write_contents.extend(x)
+    self._staged_write_cu_lens.append(len(self._staged_write_contents))
+    # 先记在 CPU 的 list 里。index 是第几行，start 是从这一行的第几列开始写，x 是要写进去的 block id。
+```
+
+`stage_write(2, 3, [3, 1, 2])` 再 `stage_write(0, 1, [-1, -2, -5])` 之后，四个 list 是：
+
+| list | 内容 | 含义 |
+|------|------|------|
+| `_staged_write_indices` | `[2, 0]` | 写第 2 行、第 0 行 |
+| `_staged_write_starts` | `[3, 1]` | 从第 3 列、第 1 列开始 |
+| `_staged_write_contents` | `[3, 1, 2, -1, -2, -5]` | 要写的 block id，两笔接在一起 |
+| `_staged_write_cu_lens` | `[3, 6]` | 第一笔是 `contents[0:3]`，第二笔是 `contents[3:6]` |
+
+```python
+def apply_write(self):
+    n = len(self._staged_write_indices)
+    if n == 0:
+        return
+    indices_uva = self.write_indices.copy_to_uva(self._staged_write_indices)
+    starts_uva = self.write_starts.copy_to_uva(self._staged_write_starts)
+    cu_lens_uva = self.write_cu_lens.copy_to_uva(self._staged_write_cu_lens)
+    # 行号、起始列、累计长度放到 pool 的下一块，kernel 从这里读。
+    write_contents = async_tensor_h2d(
+        self._staged_write_contents, device=self.device, dtype=self.dtype
+    )
+    # 只有这些新的 block id 被拷上 GPU。
+    _apply_write_kernel[(n,)](
+        self.gpu, self.gpu.stride(0),
+        indices_uva, starts_uva, write_contents, cu_lens_uva,
+        None, BLOCK_SIZE=1024, MULTI_GROUP=False,
+    )
+    # n 是笔数。一个 program 写一笔，写完四个 list 就清空。
+    self.clear_staged_writes()
+```
+
+[`_apply_write_kernel`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/buffer_utils.py#L312-L335) 算出这一笔在表里的位置，把 block id 写进去：
+
+```python
+pid = tl.program_id(0)
+row_idx = tl.load(write_indices_ptr + pid)
+start_idx = tl.load(write_starts_ptr + pid)
+cu_start = tl.load(write_cu_lens_ptr + pid - 1) if pid > 0 else 0
+cu_end = tl.load(write_cu_lens_ptr + pid)
+row_ptr = output_ptr + row_idx * row_stride + start_idx
+content = tl.load(write_contents_ptr + cu_start + block, mask=mask)
+tl.store(row_ptr + block, content, mask=mask)
+# program 0 往第 2 行第 3 列写 3,1,2。program 1 往第 0 行第 1 列写 -1,-2,-5。
+```
+
+block table 在 [`append_block_ids`](https://github.com/vllm-project/vllm/blob/e80b6c642f21fd5b24439825592f5b9ced36add8/vllm/v1/worker/gpu/block_table.py#L111-L144) 里调用 `stage_write`。`start` 是这个 slot 上已经有多少个 block，所以只追加新的。一个 KV group 时调用 `apply_write()`。多个 group 时 `FusedStagedWriter` 把它们合成一次 kernel。`num_computed_tokens` 用 `stage_write_elem(index, x)`，从第 0 列写一个数，后面同样是 `apply_write`。
+
+```mermaid
+flowchart LR
+  table["GPU 上的 block table，旧的 block id 还在"]
+  newb["这一步新加的 block id"] --> lists["四个 list：行号、起始列、内容、累计长度"]
+  lists --> pack["接成四段连续 buffer"]
+  pack --> h2d["内容拷上 GPU；行号和起始列放进 UVA pool"]
+  h2d --> ker["一个 kernel 写进表里对应的位置"]
+  ker --> table
+```
+
+### 区别
+
+V1 每一步都把前 `num_reqs` 行从 CPU 整段拷到 GPU。V2 的表留在 GPU 上，这一步只把新加的 block id 传过去，一次 kernel 写进对应的格子。CPU 不等这次写完。
