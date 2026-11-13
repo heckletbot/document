@@ -119,7 +119,7 @@ Decode：
 |------|--------|
 | `docs/source/deployment/integrations/vllm/disagg-prefill-decode.md` | `--kv-transfer-config`、`kv_producer` / `kv_consumer`、toy proxy 命令 |
 
-vLLM 上游的 `KVConnectorBase_V1` 不在本仓库。接口形状已经由 `MooncakeConnector` 的方法名体现：不必去翻 vLLM 也能学完本阶段。
+vLLM 上游的 `KVConnectorBase_V1` 不在本仓库。接口形状已经由 `MooncakeConnector` 的方法名体现：本阶段不必把 `base.py` 逐行读完。若要单独学基类、7 个 abstract 方法、以及自己写一个 NoOp / Dummy Fill，用 [KV Connector V1](../../kv-connector-v1/README.md)。
 
 `MooncakeStoreConnector` 的实现在 **vLLM 仓库**，不在 Mooncake 仓库。本周不要去搜它的源码。
 

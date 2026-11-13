@@ -63,7 +63,7 @@
 | Decode | 按 token 自回归，延迟敏感，不能被 Prefill 抢 GPU |
 | PD 分离 | Prefill / Decode 跑在不同实例或节点上，资源按负载比独立扩 |
 | XpYd | X 个 Prefill 实例 + Y 个 Decode 实例的拓扑记法，如 1P2D |
-| KV Connector | vLLM 的插件接口：调度侧决定「要远程拉/推哪些 block」，Worker 侧真正搬数据 |
+| KV Connector | vLLM 的插件接口：调度侧决定「要远程拉/推哪些 block」，Worker 侧真正搬数据。基类与最小 DIY 见 [KV Connector V1](../../kv-connector-v1/README.md) |
 | Transfer Engine | Mooncake 的传输库：注册内存、选网卡、RDMA/TCP 批量读写 |
 | Mooncake Store | 带 Master 的分布式对象池；和 P2P Connector 不是同一条路 |
 | P2P vs 共享池 | Connector 是 Prefill→Decode 直传；Store 是多实例按 hash 复用 prefix KV |
