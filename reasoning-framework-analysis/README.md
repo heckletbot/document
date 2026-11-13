@@ -7,6 +7,7 @@
 - [推理框架负载均衡路由器](../reasoning-lb-router-design.md)
 - [llm-d：EPP 预测调度 Scorer 与 Coordinator](../llm-d-epp-predicted-scorer-and-coordinator.md)
 - [Mooncake 功能学习计划](../mooncake-learning-plan/README.md)
+- [vLLM KV Connector V1](../kv-connector-v1/README.md)
 
 ---
 
