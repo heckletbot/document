@@ -8,6 +8,7 @@
 - [llm-d：EPP 预测调度 Scorer 与 Coordinator](../llm-d-epp-predicted-scorer-and-coordinator.md)
 - [Mooncake 功能学习计划](../mooncake-learning-plan/README.md)
 - [vLLM KV Connector V1](../kv-connector-v1/README.md)
+- [vLLM-Ascend 0.30 上测 Mooncake](../vllm-ascend-0.30-mooncake-test/README.md)
 
 ---
 

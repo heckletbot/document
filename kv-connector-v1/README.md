@@ -2,7 +2,7 @@
 
 目标：不依赖 Mooncake / NIXL 的传输细节，先把 **vLLM V1 的 KV Connector 插件接口** 学透，并能自己挂一个最小实现。
 
-仓库里已有 [Mooncake 学习计划](../mooncake-learning-plan/README.md)。那份计划把 Connector 当成「把 block 列表翻译成 TE 搬运」的一层，**刻意不翻** 上游 `KVConnectorBase_V1`。本笔记补这一层：基类、调度/Worker 分工、最小 DIY。
+仓库里已有 [Mooncake 学习计划](../mooncake-learning-plan/README.md)。那份计划把 Connector 当成「把 block 列表翻译成 TE 搬运」的一层，**刻意不翻** 上游 `KVConnectorBase_V1`。本笔记补这一层：基类、调度/Worker 分工、最小 DIY。在 vLLM-Ascend v0.30.0 上做 Mooncake 冒烟和替换自编译包，见 [测试教程](../vllm-ascend-0.30-mooncake-test/README.md)。
 
 对照文档：
 

@@ -17,6 +17,8 @@
 
 若要先搞清 vLLM 插件契约本身（7 个 abstract 方法、Scheduler/Worker 分工、自己挂一个 NoOp），先读 [KV Connector V1](../kv-connector-v1/README.md)，再进入本计划的阶段 3。
 
+要在 vLLM-Ascend v0.30.0 上把官方 PD 直传跑通、再换成自己编译的 Mooncake，按 [vLLM-Ascend 0.30 Mooncake 测试](../vllm-ascend-0.30-mooncake-test/README.md)。
+
 每个阶段的「要看的内容 / 要掌握的知识 / 关键代码 / 自测题」在 `plan/` 里：
 
 | 阶段 | 时长 | 文档 |
